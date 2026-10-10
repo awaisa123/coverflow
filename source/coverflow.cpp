@@ -220,11 +220,26 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
-	bool dumpOpen{ false }; // Dump Game / App workflow preview; never copies files
+	struct Pending;
+	struct DumperProgress;
+	bool dumpOpen{ false }; // Real game/app dumping workflow
+	bool manageDumpsOpen{ false }; // Backup destination/history screen
+	std::shared_ptr<DumperProgress> dumpJob;
+	std::string dumpResult;
+	bool dumpSucceeded{ false };
+	bool dumpQueued{ false };
+	std::shared_ptr<DumperProgress> dumpsJob;
+	std::shared_ptr<DumperProgress> dumpDeleteJob;
+	bool confirmDumpDelete{ false };
+	std::string dumpDeleteFolder, dumpDeleteMount;
+	std::vector<std::string> dumpEntries;
+	std::string dumpsMessage{ "Press Cross to refresh dump history." };
+	int dumpsIndex{ 0 };
 	int dumpIndex{ 0 };
-	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
-	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: simulated progress, 3: preview result
+	int dumpDestination{ 1 }; // PS5 App Dumper currently supports USB destinations only
+	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: dumping, 3: result
 	float dumpProgress{ 0.0f };
+	std::string dumpStatus;
 	int collectionIndex{ 0 };
 	static constexpr int gridCols = 7;
 	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
@@ -267,6 +282,432 @@ public:
 		bool done{ false };
 		std::string answer;
 	};
+
+	// Live state reported by the external PS5 App Dumper payload.
+	struct DumperProgress {
+		std::mutex mutex;
+		bool done{ false };
+		bool success{ false };
+		bool queued{ false };
+		float progress{ 0.0f };
+		std::string stage{ "Starting dumper" };
+		std::string answer;
+	};
+
+	// Small HTTP client for the PS5 App Dumper's local-only API.
+	// API requests stay on loopback; the dumper itself writes to console storage/USB.
+	static std::string dumperHttp(int port, const std::string &method, const std::string &path,
+		const std::string &body = "", int timeoutSeconds = 3)
+	{
+		const int fd = socket(AF_INET, SOCK_STREAM, 0);
+		if (fd < 0) return "";
+		timeval timeout{ timeoutSeconds, 0 };
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+		sockaddr_in address{};
+		address.sin_family = AF_INET;
+		address.sin_port = htons((uint16_t)port);
+		address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (connect(fd, (sockaddr *)&address, sizeof(address)) != 0) {
+			close(fd);
+			return "";
+		}
+		std::string request = method + " " + path + " HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n";
+		if (method == "POST") {
+			request += "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: " +
+				std::to_string(body.size()) + "\r\n";
+		}
+		request += "\r\n";
+		if (method == "POST") request += body;
+		bool ok = true;
+		for (size_t at = 0; at < request.size();) {
+			const ssize_t n = send(fd, request.data() + at, request.size() - at, 0);
+			if (n <= 0) { ok = false; break; }
+			at += (size_t)n;
+		}
+		std::string response;
+		char buffer[8192];
+		size_t expected = std::string::npos;
+		size_t bodyStart = std::string::npos;
+		while (ok && response.size() < (2u << 20)) {
+			const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+			if (n <= 0) break;
+			response.append(buffer, (size_t)n);
+			if (bodyStart == std::string::npos) {
+				bodyStart = response.find("\r\n\r\n");
+				if (bodyStart != std::string::npos) {
+					bodyStart += 4;
+					const size_t h = response.find("Content-Length:");
+					if (h != std::string::npos && h < bodyStart) {
+						expected = (size_t)std::strtoull(response.c_str() + h + 15, nullptr, 10);
+					}
+				}
+			}
+			if (bodyStart != std::string::npos && expected != std::string::npos &&
+				response.size() >= bodyStart + expected) break;
+		}
+		close(fd);
+		if (!ok || bodyStart == std::string::npos || response.size() < bodyStart) return "";
+		return response.substr(bodyStart, expected == std::string::npos ? std::string::npos : expected);
+	}
+
+	static std::string jsonString(const std::string &json, const std::string &key)
+	{
+		const std::string needle = "\"" + key + "\":";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return "";
+		p += needle.size();
+		while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) p++;
+		if (p >= json.size() || json[p] != '"') return "";
+		p++;
+		std::string out;
+		while (p < json.size()) {
+			char c = json[p++];
+			if (c == '"') break;
+			if (c == '\\' && p < json.size()) {
+				char escaped = json[p++];
+				if (escaped == 'n') out += '\n';
+				else if (escaped == 'r') out += '\r';
+				else if (escaped == 't') out += '\t';
+				else out += escaped;
+			} else out += c;
+		}
+		return out;
+	}
+
+	static unsigned long long jsonNumber(const std::string &json, const std::string &key)
+	{
+		const std::string needle = "\"" + key + "\":";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return 0;
+		p += needle.size();
+		while (p < json.size() && json[p] == ' ') p++;
+		return std::strtoull(json.c_str() + p, nullptr, 10);
+	}
+
+	static bool jsonTrue(const std::string &json, const std::string &key)
+	{
+		const std::string needle = "\"" + key + "\":";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return false;
+		p += needle.size();
+		while (p < json.size() && json[p] == ' ') p++;
+		return json.compare(p, 4, "true") == 0;
+	}
+
+	static std::string jsonObjectValue(const std::string &json, const std::string &key)
+	{
+		const std::string needle = "\"" + key + "\":";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return "";
+		p += needle.size();
+		while (p < json.size() && (json[p] == ' ' || json[p] == '\n' || json[p] == '\r' || json[p] == '\t')) p++;
+		if (p >= json.size() || json[p] != '{') return "";
+		const size_t start = p;
+		int depth = 0;
+		bool inString = false, escaped = false;
+		for (; p < json.size(); p++) {
+			const char c = json[p];
+			if (inString) {
+				if (escaped) escaped = false;
+				else if (c == '\\') escaped = true;
+				else if (c == '"') inString = false;
+				continue;
+			}
+			if (c == '"') inString = true;
+			else if (c == '{') depth++;
+			else if (c == '}' && --depth == 0) return json.substr(start, p - start + 1);
+		}
+		return "";
+	}
+
+	static std::vector<std::string> jsonObjectArray(const std::string &json, const std::string &key)
+	{
+		std::vector<std::string> objects;
+		const std::string needle = "\"" + key + "\":[";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return objects;
+		p += needle.size();
+		while (p < json.size() && json[p] != ']') {
+			if (json[p] == ',' || json[p] == ' ' || json[p] == '\n' || json[p] == '\r' || json[p] == '\t') {
+				p++;
+				continue;
+			}
+			if (json[p] != '{') return {};
+			const size_t start = p;
+			int depth = 0;
+			bool inString = false, escaped = false;
+			for (; p < json.size(); p++) {
+				const char c = json[p];
+				if (inString) {
+					if (escaped) escaped = false;
+					else if (c == '\\') escaped = true;
+					else if (c == '"') inString = false;
+					continue;
+				}
+				if (c == '"') inString = true;
+				else if (c == '{') depth++;
+				else if (c == '}' && --depth == 0) {
+					p++;
+					objects.push_back(json.substr(start, p - start));
+					break;
+				}
+			}
+			if (depth != 0) return {};
+		}
+		return objects;
+	}
+
+	static std::string urlEncode(const std::string &value)
+	{
+		static const char hex[] = "0123456789ABCDEF";
+		std::string out;
+		for (unsigned char c : value) {
+			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') out += (char)c;
+			else { out += '%'; out += hex[c >> 4]; out += hex[c & 15]; }
+		}
+		return out;
+	}
+
+	static int findDumperPort()
+	{
+		for (int port = 8081; port <= 8090; port++) {
+			const std::string devices = dumperHttp(port, "GET", "/api/devices", "", 1);
+			if (devices.find("\"targets\":[") != std::string::npos &&
+				devices.find("\"apps\":[") != std::string::npos) return port;
+		}
+		return 0;
+	}
+
+	static std::string chooseDumperTarget(const std::string &devices, bool internal)
+	{
+		const size_t array = devices.find("\"targets\":[");
+		if (array == std::string::npos) return "";
+		const size_t end = devices.find(']', array);
+		if (end == std::string::npos) return "";
+		size_t p = array;
+		while ((p = devices.find('{', p)) != std::string::npos && p < end) {
+			const size_t close = devices.find('}', p);
+			if (close == std::string::npos || close > end) break;
+			const std::string item = devices.substr(p, close - p + 1);
+			if (jsonTrue(item, "writable") && jsonTrue(item, "internal") == internal) {
+				const std::string mount = jsonString(item, "mount");
+				if (internal || mount.rfind("/mnt/usb", 0) == 0) return mount;
+			}
+			p = close + 1;
+		}
+		return "";
+	}
+
+	static void runDumperBackend(const std::shared_ptr<DumperProgress> &job,
+		const std::string &titleId, bool internal, const std::string &payloadPath)
+	{
+		auto finishJob = [&](bool success, bool queued, const std::string &stage, const std::string &answer) {
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->success = success;
+			job->queued = queued;
+			job->done = true;
+			job->stage = stage;
+			job->progress = success ? 0.0f : job->progress;
+			job->answer = answer;
+		};
+
+		int port = findDumperPort();
+		if (!port) {
+			// Try the configured payload path and common homebrew locations.
+			std::vector<std::string> candidates = {
+				payloadPath,
+				"/data/homebrew/PPSA99123/ps5-app-dumper.elf",
+				"/mnt/usb0/homebrew/ps5-app-dumper.elf",
+				"/mnt/usb1/homebrew/ps5-app-dumper.elf",
+				"/mnt/usb0/ps5-app-dumper/ps5-app-dumper.elf",
+				"/mnt/usb1/ps5-app-dumper/ps5-app-dumper.elf"
+			};
+			bool sent = false;
+			for (const auto &candidate : candidates) {
+				if (!candidate.empty() && sendPayload(candidate)) { sent = true; break; }
+			}
+			if (!sent) {
+				finishJob(false, false, "Payload unavailable",
+					"Dumper payload not found or payload loader on port 9021 is unavailable. Install ps5-app-dumper.elf and ensure elfldr is running.");
+				return;
+			}
+			for (int attempt = 0; attempt < 40 && !port; attempt++) {
+				usleep(500000);
+				port = findDumperPort();
+			}
+		}
+		if (!port) {
+			finishJob(false, false, "Dumper unavailable",
+				"PS5 App Dumper did not start. Check payload logs and firmware compatibility.");
+			return;
+		}
+
+		const std::string devices = dumperHttp(port, "GET", "/api/devices", "", 5);
+		if (devices.empty()) {
+			finishJob(false, false, "Dumper unavailable", "Could not read PS5 App Dumper devices.");
+			return;
+		}
+		const std::string target = chooseDumperTarget(devices, internal);
+		if (target.empty()) {
+			finishJob(false, false, "Destination unavailable",
+				internal ? "No writable internal destination is available." :
+				"No writable USB drive found. Connect a supported USB drive and retry.");
+			return;
+		}
+
+		// A proper dump needs the selected title mounted. Cover Flow cannot stay
+		// on screen while the PS5 launches that game, so submit the dumper's own
+		// queue API; its worker launches/mounts the title and runs the dump.
+		// PS5 App Dumper's documented queue API takes title IDs in q0/q1...
+		// fields, not a "titles" field. Queueing means accepted for later work,
+		// never that the files have already been copied.
+		const std::string beforeStatus = dumperHttp(port, "GET", "/api/status", "", 5);
+		if (beforeStatus.empty() || jsonTrue(jsonObjectValue(beforeStatus, "queue"), "active")) {
+			finishJob(false, false, "Dumper busy", "Cannot verify an idle dumper queue. Retry after it finishes.");
+			return;
+		}
+		const std::string form = "q0=" + urlEncode(titleId) +
+			"&target=" + urlEncode(target) + "&replace=0";
+		const std::string response = dumperHttp(port, "POST", "/api/queue/start", form, 10);
+		if (response.find("\"ok\":true") == std::string::npos &&
+			response.find("\"started\":true") == std::string::npos) {
+			std::string err = jsonString(response, "error");
+			if (err.empty()) err = response.empty() ?
+				"PS5 App Dumper did not accept the queue request." : response;
+			finishJob(false, false, "Queue rejected", err);
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->success = true;
+			job->queued = true;
+			job->done = false;
+			job->stage = "Queued — waiting for dumper";
+			job->progress = 0.0f;
+			job->answer = "Queue accepted. Waiting for the external dumper to report real progress.";
+		}
+
+		// Poll the upstream status endpoint while the queue runs. This provides
+		// real copied/total byte progress and final per-title queue state; never
+		// turn a queue acknowledgement into a false "completed" result.
+		int idlePolls = 0;
+		bool observedOurQueue = false;
+		for (int attempt = 0; attempt < 43200; attempt++) {
+			sleep(1);
+			const std::string status = dumperHttp(port, "GET", "/api/status", "", 4);
+			if (status.empty()) {
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->stage = "Waiting for dumper status";
+				continue;
+			}
+			const std::string jobJson = jsonObjectValue(status, "job");
+			const std::string queueJson = jsonObjectValue(status, "queue");
+			const bool queueActive = jsonTrue(queueJson, "active");
+			const unsigned long long total = jsonNumber(jobJson, "totalBytes");
+			const unsigned long long copied = jsonNumber(jobJson, "copiedBytes");
+			const std::string liveTitle = jsonString(jobJson, "titleId");
+			const std::string liveStage = jsonString(jobJson, "stage");
+			const auto items = jsonObjectArray(queueJson, "items");
+			std::string ourState, ourMessage;
+			for (const auto &item : items) {
+				if (jsonString(item, "titleId") == titleId) {
+					ourState = jsonString(item, "state");
+					ourMessage = jsonString(item, "message");
+					break;
+				}
+			}
+			if (!ourState.empty()) observedOurQueue = true;
+			{
+				std::lock_guard<std::mutex> lock(job->mutex);
+				if (total > 0 && liveTitle == titleId && ourState == "dumping")
+					job->progress = std::clamp((float)copied / (float)total, 0.0f, 1.0f);
+				if (!ourState.empty()) job->stage = ourState;
+				else if (!liveStage.empty() && liveTitle == titleId) job->stage = liveStage;
+				else job->stage = queueActive ? "Queue running" : "Checking final status";
+				if (!ourMessage.empty()) job->answer = ourMessage;
+			}
+
+			if (queueActive) {
+				idlePolls = 0;
+				continue;
+			}
+			idlePolls++;
+			if (idlePolls < 3) continue;
+
+			if (observedOurQueue && ourState == "done") {
+				finishJob(true, false, "Complete",
+					"Dump completed for " + titleId + ". " +
+					(total > 0 ? ("Copied " + formatSize((long long)copied) + " of " + formatSize((long long)total) + ".") : "The dumper reported the title as complete."));
+				return;
+			}
+			if (ourState == "failed" || ourState == "skipped") {
+				finishJob(false, false, ourState == "failed" ? "Dump failed" : "Dump skipped",
+					ourMessage.empty() ? ("The dumper marked " + titleId + " as " + ourState + ".") : ourMessage);
+				return;
+			}
+			finishJob(false, false, "Result unverified",
+				observedOurQueue ? "Queue ended without a definitive result. Check the dumper log." :
+				"The submitted title was not observed in the queue. Check the dumper log.");
+			return;
+		}
+		finishJob(false, false, "Timed out",
+			"Stopped waiting after 12 hours. Check PS5 App Dumper for the current queue state.");
+	}
+
+	void refreshDumpHistory()
+	{
+		if (dumpsJob) {
+			std::lock_guard<std::mutex> lock(dumpsJob->mutex);
+			if (!dumpsJob->done) {
+				dumpsMessage = "Refreshing dump history…";
+				return;
+			}
+		}
+		dumpsJob = std::make_shared<DumperProgress>();
+		dumpsMessage = "Connecting to PS5 App Dumper…";
+		const auto job = dumpsJob;
+		std::thread([job]() {
+			int port = findDumperPort();
+			if (!port) {
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->done = true;
+				job->success = false;
+				job->stage = "Dumper unavailable";
+				job->answer = "PS5 App Dumper is not running or its local API is unavailable.";
+				return;
+			}
+			const std::string response = dumperHttp(port, "GET", "/api/dumps", "", 8);
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = true;
+			job->success = response.find("\"dumps\":[") != std::string::npos;
+			job->stage = job->success ? "History loaded" : "History unavailable";
+			job->answer = response.empty() ? "The dumper returned no response." :
+				(job->success ? response : "The dumper did not return a dumps list. Check its API/version.");
+		}).detach();
+	}
+
+	void deleteIncompleteDump()
+	{
+		if (dumpDeleteJob || dumpDeleteFolder.empty() || dumpDeleteMount.empty()) return;
+		const std::string mount = dumpDeleteMount, folder = dumpDeleteFolder;
+		confirmDumpDelete = false;
+		dumpDeleteJob = std::make_shared<DumperProgress>();
+		const auto job = dumpDeleteJob;
+		dumpsMessage = "Requesting deletion of unfinished dump…";
+		std::thread([job, mount, folder]() {
+			const int port = findDumperPort();
+			const std::string form = "mount=" + urlEncode(mount) + "&folder=" + urlEncode(folder);
+			const std::string response = port ? dumperHttp(port, "POST", "/api/dumps/delete", form, 15) : "";
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = true;
+			job->success = response.find("\"deleted\":true") != std::string::npos;
+			job->answer = job->success ? "Unfinished dump deleted." :
+				"Delete refused or dumper unavailable. Only unfinished dumps can be removed.";
+		}).detach();
+	}
+
 	std::shared_ptr<Pending> updateCheckJob, updateApplyJob;
 	bool updateDialog{ false };
 	int updateChoice{ 0 };
@@ -3010,7 +3451,7 @@ public:
 			"Category:  " + categoryName(g.section) + (sectionOverride.count(g.titleId) ? "" : "  (automatic)"),
 			"Collections:  " + collectionSummary(g),
 			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow",
-			"Dump Game / App", "Close" };
+			"Dump Game / App", "Manage Dumps", "Close" };
 	}
 
 	std::string collectionSummary(const Game &g) const
@@ -3103,13 +3544,22 @@ public:
 			break;
 		case 5:
 			dumpOpen = true;
+			manageDumpsOpen = false;
 			dumpIndex = 0;
-			dumpDestination = 0;
+			dumpDestination = 1;
 			dumpStage = 0;
 			dumpProgress = 0.0f;
 			break;
+		case 6:
+			manageDumpsOpen = true;
+			dumpOpen = false;
+			dumpEntries.clear();
+			dumpsIndex = 0;
+			refreshDumpHistory();
+			break;
 		default:
 			menuOpen = false;
+			manageDumpsOpen = false;
 			break;
 		}
 	}
@@ -3412,16 +3862,98 @@ public:
 			categoryOpen = false;
 			collectionsOpen = false;
 			dumpOpen = false;
+			manageDumpsOpen = false;
 			playSound(menuOpen ? 1 : 2);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
 		}
-		if (menuOpen && dumpOpen) {
-			// The preview deliberately simulates progress only; it never touches game files.
-			if (dumpStage == 2) {
-				dumpProgress = std::min(1.0f, dumpProgress + dt * 0.35f);
-				if (dumpProgress >= 1.0f) {
+		if (menuOpen && manageDumpsOpen) {
+			if (dumpsJob) {
+				bool done = false, success = false;
+				std::string answer;
+				{
+					std::lock_guard<std::mutex> lock(dumpsJob->mutex);
+					done = dumpsJob->done;
+					success = dumpsJob->success;
+					answer = dumpsJob->answer;
+				}
+				if (done) {
+					if (success) {
+						dumpEntries = jsonObjectArray(answer, "dumps");
+						dumpsMessage = dumpEntries.empty() ? "No dumps found on the connected dumper." :
+							std::to_string(dumpEntries.size()) + " dump entries loaded.";
+					} else {
+						dumpsMessage = answer.empty() ? "Could not load dump history." : answer;
+						dumpEntries.clear();
+					}
+					dumpsJob.reset();
+					dumpsIndex = std::clamp(dumpsIndex, 0, std::max(0, (int)dumpEntries.size() - 1));
+				}
+			}
+			if (dumpDeleteJob) {
+				bool done = false, success = false;
+				std::string answer;
+				{
+					std::lock_guard<std::mutex> lock(dumpDeleteJob->mutex);
+					done = dumpDeleteJob->done;
+					success = dumpDeleteJob->success;
+					answer = dumpDeleteJob->answer;
+				}
+				if (done) {
+					dumpDeleteJob.reset();
+					dumpsMessage = answer;
+					if (success) refreshDumpHistory();
+				}
+			}
+			if (confirmDumpDelete) {
+				if (p.pressed & PAD_CROSS) deleteIncompleteDump();
+				else if (p.pressed & PAD_CIRCLE) confirmDumpDelete = false;
+			} else {
+			if (p.pressed & PAD_UP) {
+				if (!dumpEntries.empty()) dumpsIndex = (dumpsIndex + (int)dumpEntries.size() - 1) % (int)dumpEntries.size();
+			}
+			if (p.pressed & PAD_DOWN) {
+				if (!dumpEntries.empty()) dumpsIndex = (dumpsIndex + 1) % (int)dumpEntries.size();
+			}
+			if (p.pressed & PAD_CROSS) {
+				refreshDumpHistory();
+			}
+			if ((p.pressed & PAD_SQUARE) && !dumpsJob && !dumpDeleteJob && !dumpEntries.empty()) {
+				const std::string &entry = dumpEntries[(size_t)dumpsIndex];
+				if (jsonString(entry, "state") == "incomplete" &&
+					!jsonTrue(entry, "inUse") && !jsonTrue(entry, "internal")) {
+					dumpDeleteFolder = jsonString(entry, "folder");
+					dumpDeleteMount = jsonString(entry, "mount");
+					confirmDumpDelete = !dumpDeleteFolder.empty() && !dumpDeleteMount.empty();
+				} else dumpsMessage = "Only unused, unfinished USB dumps can be deleted.";
+			}
+			if (p.pressed & PAD_CIRCLE) {
+				manageDumpsOpen = false;
+				circleHeld = -10.0f;
+			}
+			}
+		} else if (menuOpen && dumpOpen) {
+			// Queue acceptance and status are read from the external dumper job off the render thread.
+			if (dumpStage == 2 && dumpJob) {
+				bool done = false, success = false, queued = false;
+				std::string answer, stage;
+				{
+					std::lock_guard<std::mutex> lock(dumpJob->mutex);
+					done = dumpJob->done;
+					success = dumpJob->success;
+					queued = dumpJob->queued;
+					dumpProgress = dumpJob->progress;
+					answer = dumpJob->answer;
+					stage = dumpJob->stage;
+				}
+				dumpStatus = stage;
+				if (done) {
+					dumpResult = answer;
+					dumpSucceeded = success;
+					dumpQueued = queued;
+					dumpProgress = dumpSucceeded ? (dumpQueued ? 0.0f : 1.0f) : dumpProgress;
+					dumpJob.reset();
 					dumpStage = 3;
 					dumpIndex = 0;
 				}
@@ -3436,8 +3968,13 @@ public:
 			if (p.pressed & PAD_CROSS) {
 				if (dumpStage == 0) {
 					if (dumpIndex < 2) {
-						dumpDestination = dumpIndex;
-						showMessage(dumpDestination == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
+						if (dumpIndex == 0) {
+							dumpDestination = 1;
+							showMessage("PS5 App Dumper writes to USB only. Choose USB drive.", 3.0f);
+						} else {
+							dumpDestination = 1;
+							showMessage("Destination: USB drive", 2.0f);
+						}
 					} else if (dumpIndex == 2) {
 						dumpStage = 1;
 						dumpIndex = 0;
@@ -3447,8 +3984,31 @@ public:
 					}
 				} else if (dumpStage == 1) {
 					if (dumpIndex == 0) {
-						dumpStage = 2;
-						dumpProgress = 0.0f;
+						const Game *selectedGame = current();
+						if (!selectedGame || !isTitleId(selectedGame->titleId)) {
+							dumpResult = "err selected item has no valid title ID";
+							dumpSucceeded = false;
+							dumpStage = 3;
+						} else {
+							dumpResult.clear();
+							dumpSucceeded = false;
+							dumpQueued = false;
+							dumpProgress = 0.0f;
+							dumpJob = std::make_shared<DumperProgress>();
+							dumpStatus = "Preparing real PS5 dump";
+							const auto job = dumpJob;
+							const std::string titleId = selectedGame->titleId;
+							const bool internal = dumpDestination == 0;
+							const std::string root = appRoot();
+							const std::string payloadPath = "/data/homebrew/" +
+								(ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId) + "/ps5-app-dumper.elf";
+							std::thread([job, titleId, internal, payloadPath, root]() {
+								const std::string localPayload = std::ifstream(payloadPath, std::ios::binary).good()
+									? payloadPath : root + "ps5-app-dumper.elf";
+								VulkanExample::runDumperBackend(job, titleId, internal, localPayload);
+							}).detach();
+							dumpStage = 2;
+						}
 					} else {
 						dumpStage = 0;
 						dumpIndex = 0;
@@ -4076,61 +4636,300 @@ public:
 			}
 		}
 
-		// ---- Dump Game / App: complete navigable UI preview; no package extraction or file copying
+		// ---- Dump Game / App: native PS5 layout matching the desktop UI concept
 		if (menuAnim > 0.01f && menuOpen && dumpOpen && current()) {
 			const Game &game = *current();
-			const float a = menuAnim, w = 900.0f * s, h = 610.0f * s;
+			const float a = menuAnim;
+			const float w = 1120.0f * s, h = 650.0f * s;
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
 			panel(x0, y0, w, h, a);
-			const float pad = 36.0f * s;
-			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 48.0f * s;
-			text("Dump Game / App", 32.0f * s, rowX, y0 + 26.0f * s, withAlpha(textC, a));
-			text(fit(game.title, 22.0f * s, rowW), 22.0f * s, rowX, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("TITLE ID", 16.0f * s, rowX, y0 + 112.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, rowX, y0 + 136.0f * s, withAlpha(textC, a), 0.0f, false);
 
-			const float rowY = y0 + 172.0f * s;
-			std::vector<std::string> dumpLabels;
-			if (dumpStage == 0) {
-				dumpLabels = { "Internal storage", "USB drive", "Continue", "Cancel" };
-			} else if (dumpStage == 1) {
-				dumpLabels = { "Run UI preview", "Back to destination" };
-			} else if (dumpStage == 3) {
-				dumpLabels = { "Choose another destination", "Close" };
+			const float pad = 28.0f * s;
+			const float leftX = x0 + pad, leftW = 300.0f * s;
+			const float gap = 22.0f * s;
+			const float rightX = leftX + leftW + gap, rightW = w - (rightX - x0) - pad;
+			const float topY = y0 + 24.0f * s;
+			const float muted = withAlpha(dimC, a);
+			const float bodyY = y0 + 104.0f * s;
+
+			// Header and compact three-step indicator.
+			text("DUMP GAME / APP", 29.0f * s, leftX, topY, withAlpha(textC, a));
+			text("GAME MANAGER", 13.0f * s, x0 + w - pad, topY + 8.0f * s, withAlpha(accentC, a), 1.0f, false);
+			const char *stageName = dumpStage == 0 ? "DESTINATION" : dumpStage == 1 ? "CONFIRM" :
+				(dumpStage == 2 ? "DUMP IN PROGRESS" : (dumpQueued ? "DUMP QUEUED" : (dumpSucceeded ? "COMPLETE" : "FAILED")));
+			text(stageName, 14.0f * s, rightX, y0 + 65.0f * s, muted, 0.0f, false);
+			const float stepGap = 8.0f * s, stepW = (rightW - stepGap * 2.0f) / 3.0f;
+			for (int i = 0; i < 3; i++) {
+				const float sx = rightX + i * (stepW + stepGap), sy = y0 + 91.0f * s;
+				const bool done = i < dumpStage || dumpStage == 3;
+				dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + stepW, sy + 5.0f * s),
+					done ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(30 * a)), 3.0f * s);
 			}
-			for (int i = 0; i < (int)dumpLabels.size(); i++) {
-				const float ry = rowY + i * (rowH + 7.0f * s);
-				const bool on = i == dumpIndex;
-				dl->AddRectFilled(ImVec2(rowX, ry), ImVec2(rowX + rowW, ry + rowH),
-					on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
-				text(dumpLabels[i], 20.0f * s, rowX + 20.0f * s, ry + 12.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				if (dumpStage == 0 && i < 2 && dumpDestination == i) {
-					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 15.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
+
+			// Left column: real selected title, never fictional sample data.
+			const float cardY = bodyY, cardH = 258.0f * s;
+			dl->AddRectFilled(ImVec2(leftX, cardY), ImVec2(leftX + leftW, cardY + cardH),
+				IM_COL32(20, 31, 49, (int)(245 * a)), 13.0f * s);
+			dl->AddRect(ImVec2(leftX, cardY), ImVec2(leftX + leftW, cardY + cardH),
+				IM_COL32(255, 255, 255, (int)(32 * a)), 13.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float artX = leftX + 18.0f * s, artY = cardY + 18.0f * s;
+			const float artW = 82.0f * s, artH = 106.0f * s;
+			dl->AddRectFilled(ImVec2(artX, artY), ImVec2(artX + artW, artY + artH),
+				withAlpha(accentC, a * 0.82f), 9.0f * s);
+			std::string mark = game.title.empty() ? "?" : game.title.substr(0, 1);
+			text(mark, 37.0f * s, artX + artW * 0.5f, artY + artH * 0.5f,
+				withAlpha(white, a), 0.5f, true);
+			const float titleX = artX + artW + 14.0f * s;
+			text(fit(game.title, 20.0f * s, leftW - 132.0f * s), 20.0f * s, titleX, artY + 5.0f * s,
+				withAlpha(textC, a), 0.0f, false);
+			text(game.platform.empty() ? "Installed application" : game.platform + " title", 14.0f * s,
+				titleX, artY + 34.0f * s, muted, 0.0f, false);
+			text(game.titleId.empty() ? "No title ID" : game.titleId, 13.0f * s,
+				titleX, artY + 59.0f * s, withAlpha(accentC, a), 0.0f, false);
+			const float infoY = artY + artH + 20.0f * s;
+			text("INSTALLED SIZE", 12.0f * s, artX, infoY, muted, 0.0f, false);
+			text(game.bytes > 0 ? formatSize(game.bytes) : "Checking size…", 19.0f * s,
+				artX, infoY + 19.0f * s, withAlpha(textC, a), 0.0f, false);
+			dl->AddLine(ImVec2(artX, infoY + 52.0f * s), ImVec2(leftX + leftW - 18.0f * s, infoY + 52.0f * s),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 1.0f * s);
+			text("Selected from your Cover Flow library", 13.0f * s, artX, infoY + 64.0f * s,
+				muted, 0.0f, false);
+
+			const float info2Y = cardY + cardH + 14.0f * s;
+			text("BEFORE YOU START", 13.0f * s, leftX + 2.0f * s, info2Y, withAlpha(accentC, a), 0.0f, false);
+			text("Keep the destination connected", 15.0f * s, leftX + 2.0f * s, info2Y + 25.0f * s,
+				withAlpha(textC, a), 0.0f, false);
+			text("while the external dumper is working.", 14.0f * s, leftX + 2.0f * s, info2Y + 47.0f * s,
+				muted, 0.0f, false);
+			text("Queue accepted does not mean completed.", 13.0f * s, leftX + 2.0f * s, info2Y + 77.0f * s,
+				muted, 0.0f, false);
+
+			// Right workflow card.
+			const float panelY = bodyY, panelH = h - (bodyY - y0) - 42.0f * s;
+			dl->AddRectFilled(ImVec2(rightX, panelY), ImVec2(rightX + rightW, panelY + panelH),
+				IM_COL32(13, 22, 36, (int)(242 * a)), 13.0f * s);
+			dl->AddRect(ImVec2(rightX, panelY), ImVec2(rightX + rightW, panelY + panelH),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 13.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float rx = rightX + 22.0f * s, rw = rightW - 44.0f * s;
+			const float contentY = panelY + 22.0f * s;
+			const std::string destinationName = dumpDestination == 0 ? "Internal storage" : "USB drive";
+
+			if (dumpStage == 0) {
+				text("Choose destination", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text("Where should the dumper write the output?", 15.0f * s, rx, contentY + 31.0f * s, muted, 0.0f, false);
+				const float destY = contentY + 68.0f * s, destGap = 12.0f * s;
+				const float destW = (rw - destGap) * 0.5f, destH = 104.0f * s;
+				for (int i = 0; i < 2; i++) {
+					const float dx = rx + i * (destW + destGap);
+					const bool selected = dumpDestination == i;
+					const bool focused = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(dx, destY), ImVec2(dx + destW, destY + destH),
+						selected ? withAlpha(accentC, a * 0.30f) : IM_COL32(255, 255, 255, (int)(12 * a)), 10.0f * s);
+					dl->AddRect(ImVec2(dx, destY), ImVec2(dx + destW, destY + destH),
+						IM_COL32(112, 164, 255, (int)((focused ? 210 : selected ? 120 : 42) * a)),
+						10.0f * s, ImDrawCornerFlags_All, focused ? 2.0f * s : 1.0f * s);
+					text(i == 0 ? "INTERNAL" : "USB DRIVE", 13.0f * s, dx + 14.0f * s, destY + 14.0f * s,
+						muted, 0.0f, false);
+					text(i == 0 ? "Not supported by dumper" : "External storage", 17.0f * s, dx + 14.0f * s,
+						destY + 39.0f * s, withAlpha(i == 0 ? muted : textC, a), 0.0f, false);
+					text(i == 0 ? "UNAVAILABLE" : (selected ? "SELECTED" : "USB target"), 12.0f * s,
+						dx + 14.0f * s, destY + 72.0f * s, selected && i == 1 ? withAlpha(accentC, a) : muted, 0.0f, false);
+				}
+				const float btnY = destY + destH + 20.0f * s, btnH = 46.0f * s;
+				const float continueW = rw * 0.62f, cancelX = rx + continueW + 10.0f * s;
+				const bool contFocus = dumpIndex == 2, cancelFocus = dumpIndex == 3;
+				dl->AddRectFilled(ImVec2(rx, btnY), ImVec2(rx + continueW, btnY + btnH),
+					contFocus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+				dl->AddRectFilled(ImVec2(cancelX, btnY), ImVec2(rx + rw, btnY + btnH),
+					cancelFocus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+				text("Continue  >", 17.0f * s, rx + 14.0f * s, btnY + 13.0f * s,
+					withAlpha(contFocus ? white : textC, a), 0.0f, false);
+				text("Cancel", 17.0f * s, cancelX + 12.0f * s, btnY + 13.0f * s,
+					withAlpha(cancelFocus ? white : textC, a), 0.0f, false);
+				const float noteY = btnY + btnH + 23.0f * s;
+				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
+					IM_COL32(77, 67, 45, (int)(105 * a)), 8.0f * s);
+				text("NOTE", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s, IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
+				text("USB-only output; progress and final status are reported by the external dumper.", 13.0f * s, rx + 12.0f * s,
+					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
+			} else if (dumpStage == 1) {
+				text("Review dump request", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text("Confirm the selected title and destination.", 15.0f * s, rx, contentY + 31.0f * s, muted, 0.0f, false);
+				const float rowsY = contentY + 72.0f * s, rowH = 48.0f * s;
+				const char *labels[] = { "Selected title", "Title ID", "Platform", "Estimated size", "Destination", "Operation" };
+				const std::string values[] = { game.title, game.titleId.empty() ? "Unavailable" : game.titleId,
+					game.platform.empty() ? "Application" : game.platform,
+					game.bytes > 0 ? formatSize(game.bytes) : "Unknown",
+					destinationName, "External PS5 App Dumper" };
+				for (int i = 0; i < 6; i++) {
+					const float ry = rowsY + i * rowH;
+					if (i % 2 == 0) dl->AddRectFilled(ImVec2(rx, ry), ImVec2(rx + rw, ry + rowH - 2.0f * s),
+						IM_COL32(255, 255, 255, (int)(9 * a)), 5.0f * s);
+					text(labels[i], 14.0f * s, rx + 10.0f * s, ry + 14.0f * s, muted, 0.0f, false);
+					text(fit(values[i], 15.0f * s, rw * 0.52f), 15.0f * s, rx + rw - 10.0f * s,
+						ry + 14.0f * s, withAlpha(textC, a), 1.0f, false);
+				}
+				const float btnY = rowsY + 6.0f * rowH + 15.0f * s, btnH = 44.0f * s;
+				const float btnW = (rw - 10.0f * s) * 0.5f;
+				for (int i = 0; i < 2; i++) {
+					const float bx = rx + i * (btnW + 10.0f * s);
+					const bool focus = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(bx, btnY), ImVec2(bx + btnW, btnY + btnH),
+						focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+					text(i == 0 ? "Start dump" : "Back", 16.0f * s, bx + 14.0f * s, btnY + 12.0f * s,
+						withAlpha(focus ? white : textC, a), 0.0f, false);
+				}
+				text("The dumper may launch the selected title and close Cover Flow.", 13.0f * s, rx,
+					panelY + panelH - 29.0f * s, muted, 0.0f, false);
+			} else if (dumpStage == 2) {
+				text("Submitting to PS5 App Dumper", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text(dumpStatus.empty() ? "Preparing dumper…" : dumpStatus, 16.0f * s, rx, contentY + 36.0f * s,
+					muted, 0.0f, false);
+
+				// Match the prototype's circular progress treatment without inventing
+				// a percentage: the queue API does not expose extraction progress here.
+				const ImVec2 ringCenter(rx + rw * 0.5f, contentY + 139.0f * s);
+				const float ringRadius = 47.0f * s;
+				dl->AddCircle(ringCenter, ringRadius, IM_COL32(255, 255, 255, (int)(30 * a)), 64, 9.0f * s);
+				const float phase = (float)std::fmod(introTime * 3.2, 6.28318530718);
+				const ImVec2 spinnerDot(ringCenter.x + std::cos(phase) * ringRadius,
+					ringCenter.y + std::sin(phase) * ringRadius);
+				dl->AddCircleFilled(spinnerDot, 6.0f * s, withAlpha(accentC, a), 20);
+				text("…", 26.0f * s, ringCenter.x, ringCenter.y - 14.0f * s,
+					withAlpha(textC, a), 0.5f, false);
+				const bool hasByteProgress = dumpProgress > 0.0f;
+				text(hasByteProgress ? (std::to_string((int)std::round(dumpProgress * 100.0f)) + "% COPIED")
+					: "WAITING FOR LIVE BYTE COUNTERS", 12.0f * s, rx, contentY + 202.0f * s,
+					hasByteProgress ? withAlpha(accentC, a) : muted, 0.0f, false);
+				const float barY = contentY + 218.0f * s;
+				dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw, barY + 8.0f * s),
+					IM_COL32(255, 255, 255, (int)(24 * a)), 4.0f * s);
+				if (hasByteProgress) {
+					dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw * std::clamp(dumpProgress, 0.0f, 1.0f), barY + 8.0f * s),
+						withAlpha(accentC, a), 4.0f * s);
+				}
+
+				const float statusY = contentY + 242.0f * s, rowH = 39.0f * s;
+				const char *statusLabels[] = { "Connect to dumper", "Check destination", "Queue selected title" };
+				for (int i = 0; i < 3; i++) {
+					const float sy = statusY + i * rowH;
+					dl->AddCircleFilled(ImVec2(rx + 8.0f * s, sy + 10.0f * s), 4.0f * s,
+						i == 0 ? withAlpha(accentC, a) : IM_COL32(80, 98, 124, (int)(220 * a)), 16);
+					text(statusLabels[i], 14.0f * s, rx + 22.0f * s, sy + 1.0f * s,
+						withAlpha(i == 0 ? textC : muted, a), 0.0f, false);
+				}
+				const float noteY = statusY + 3.0f * rowH + 2.0f * s;
+				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
+					IM_COL32(77, 67, 45, (int)(90 * a)), 8.0f * s);
+				text("LIVE DUMPER STATUS", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s,
+					IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
+				text("Byte progress appears when the dumper reports copied and total bytes.", 13.0f * s, rx + 12.0f * s,
+					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
+			} else {
+				const bool success = dumpQueued || dumpSucceeded;
+				const ImU32 statusCol = success ? IM_COL32(112, 224, 172, (int)(255 * a)) : IM_COL32(255, 124, 140, (int)(255 * a));
+				dl->AddCircleFilled(ImVec2(rx + 28.0f * s, contentY + 20.0f * s), 20.0f * s,
+					success ? IM_COL32(21, 60, 53, (int)(255 * a)) : IM_COL32(68, 29, 39, (int)(255 * a)), 32);
+				text(success ? "OK" : "!", 16.0f * s, rx + 28.0f * s, contentY + 20.0f * s,
+					statusCol, 0.5f, true);
+				text(dumpQueued ? "Dump queued" : (dumpSucceeded ? "Dump completed" : "Dump could not start"),
+					24.0f * s, rx + 58.0f * s, contentY + 8.0f * s, withAlpha(textC, a), 0.0f, false);
+				text(dumpQueued ? "The request was accepted, not completed yet." :
+					(dumpSucceeded ? "The dumper reported completion." : "Check the message below and the dumper log."),
+					15.0f * s, rx + 58.0f * s, contentY + 38.0f * s, muted, 0.0f, false);
+				const float resultY = contentY + 91.0f * s;
+				dl->AddRectFilled(ImVec2(rx, resultY), ImVec2(rx + rw, resultY + 150.0f * s),
+					IM_COL32(255, 255, 255, (int)(10 * a)), 8.0f * s);
+				text("TITLE", 12.0f * s, rx + 12.0f * s, resultY + 12.0f * s, muted, 0.0f, false);
+				text(fit(game.title, 16.0f * s, rw - 24.0f * s), 16.0f * s, rx + 12.0f * s,
+					resultY + 31.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("DESTINATION", 12.0f * s, rx + 12.0f * s, resultY + 61.0f * s, muted, 0.0f, false);
+				text(destinationName, 16.0f * s, rx + 12.0f * s, resultY + 80.0f * s, withAlpha(textC, a), 0.0f, false);
+				std::string detail = dumpResult;
+				if (detail.size() > 150) detail = detail.substr(0, 147) + "...";
+				text(fit(detail, 13.0f * s, rw - 24.0f * s), 13.0f * s, rx + 12.0f * s,
+					resultY + 117.0f * s, muted, 0.0f, false);
+				const float btnY = resultY + 166.0f * s, btnH = 44.0f * s;
+				const float btnW = (rw - 10.0f * s) * 0.5f;
+				for (int i = 0; i < 2; i++) {
+					const float bx = rx + i * (btnW + 10.0f * s);
+					const bool focus = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(bx, btnY), ImVec2(bx + btnW, btnY + btnH),
+						focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+					text(i == 0 ? "Choose another destination" : "Close", 15.0f * s, bx + 12.0f * s,
+						btnY + 12.0f * s, withAlpha(focus ? white : textC, a), 0.0f, false);
 				}
 			}
-			const float statusY = y0 + 398.0f * s;
-			if (dumpStage == 0) {
-				text("DESTINATION", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text(dumpDestination == 0 ? "Internal storage" : "USB drive", 19.0f * s, rowX, statusY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("Choose where an export would be saved.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 1) {
-				text("READY TO PREVIEW", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("This is a UI demonstration only. No files will be read or written.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 2 || dumpStage == 3) {
-				text(dumpStage == 2 ? "SIMULATED EXPORT PROGRESS" : "PREVIEW COMPLETE", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				const float barY = statusY + 30.0f * s;
-				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
-				if (dumpProgress > 0.0f) {
-					dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW * dumpProgress, barY + 14.0f * s), withAlpha(accentC, a), 6.0f * s);
-				}
-				const int percent = (int)(dumpProgress * 100.0f);
-				text(std::to_string(percent) + "%  ·  " + (dumpStage == 2 ? "Simulating progress…" : "Preview finished"), 17.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("No game data was dumped. Export support is not connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			}
-			const char *navigationHint = dumpStage == 2 ? "Circle: cancel preview" : "D-pad: navigate";
+
+			const char *navigationHint = dumpStage == 2 ? "Waiting for dumper" : "D-pad: navigate";
 			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
-				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
+				x0 + w * 0.5f, y0 + h - 20.0f * s, a);
+		}
+
+
+		// ---- Manage Dumps: real empty state until a backup-history source is available
+		if (menuAnim > 0.01f && menuOpen && manageDumpsOpen) {
+			const float a = menuAnim, w = 1120.0f * s, h = 650.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
+			panel(x0, y0, w, h, a);
+			const float pad = 30.0f * s;
+			text("MANAGE DUMPS", 29.0f * s, x0 + pad, y0 + 25.0f * s, withAlpha(textC, a));
+			text("BACKUP LIBRARY", 13.0f * s, x0 + w - pad, y0 + 34.0f * s, withAlpha(accentC, a), 1.0f, false);
+			const float bodyY = y0 + 88.0f * s, bodyH = h - 145.0f * s;
+			dl->AddRectFilled(ImVec2(x0 + pad, bodyY), ImVec2(x0 + w - pad, bodyY + bodyH),
+				IM_COL32(13, 22, 36, (int)(242 * a)), 12.0f * s);
+			dl->AddRect(ImVec2(x0 + pad, bodyY), ImVec2(x0 + w - pad, bodyY + bodyH),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 12.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float listX = x0 + pad + 20.0f * s;
+			const float listW = w - 2.0f * (pad + 20.0f * s);
+			const float rowH = 58.0f * s;
+			if (dumpEntries.empty()) {
+				const float cx = W * 0.5f, cy = bodyY + bodyH * 0.36f;
+				dl->AddRect(ImVec2(cx - 24.0f * s, cy - 17.0f * s), ImVec2(cx + 24.0f * s, cy + 17.0f * s),
+					withAlpha(accentC, a), 5.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+				dl->AddLine(ImVec2(cx - 12.0f * s, cy - 5.0f * s), ImVec2(cx + 12.0f * s, cy - 5.0f * s), withAlpha(accentC, a), 2.0f * s);
+				dl->AddLine(ImVec2(cx - 12.0f * s, cy + 4.0f * s), ImVec2(cx + 12.0f * s, cy + 4.0f * s), withAlpha(accentC, a), 2.0f * s);
+				text(dumpsMessage, 19.0f * s, cx, cy + 43.0f * s, withAlpha(textC, a), 0.5f, false);
+				text("Press Cross to refresh. History comes from PS5 App Dumper.", 14.0f * s, cx,
+					cy + 78.0f * s, withAlpha(dimC, a), 0.5f, false);
+			} else {
+				const int visibleRows = std::max(1, (int)((bodyH - 56.0f * s) / rowH));
+				const int start = std::max(0, std::min(dumpsIndex - visibleRows + 1, (int)dumpEntries.size() - visibleRows));
+				for (int i = start; i < (int)dumpEntries.size() && i < start + visibleRows; i++) {
+					const std::string &entry = dumpEntries[(size_t)i];
+					const float ry = bodyY + 12.0f * s + (i - start) * rowH;
+					if (i == dumpsIndex) {
+						dl->AddRectFilled(ImVec2(listX, ry), ImVec2(listX + listW, ry + rowH - 5.0f * s),
+							withAlpha(accentC, a * 0.28f), 8.0f * s);
+					}
+					const std::string title = jsonString(entry, "title");
+					const std::string titleId = jsonString(entry, "titleId");
+					const std::string folder = jsonString(entry, "folder");
+					const std::string mount = jsonString(entry, "mount");
+					const std::string state = jsonString(entry, "state");
+					const unsigned long long bytes = jsonNumber(entry, "bytes");
+					const bool internal = jsonTrue(entry, "internal");
+					const bool inUse = jsonTrue(entry, "inUse");
+					const bool fself = jsonNumber(entry, "fself") != 0;
+					const std::string label = !title.empty() ? title : (!titleId.empty() ? titleId : folder);
+					text(fit(label, 19.0f * s, listW * 0.55f), 19.0f * s,
+						listX + 14.0f * s, ry + 7.0f * s, withAlpha(textC, a), 0.0f, false);
+					std::string flags = titleId.rfind("CUSA", 0) == 0 ? "PS4" : "PS5";
+					if (fself) flags += "  •  FSELF";
+					if (inUse) flags += "  •  IN USE";
+					text((state.empty() || state == "done" ? "COMPLETE" : "INCOMPLETE") +
+						std::string("  •  ") + (bytes ? formatSize(bytes) : "size unavailable"), 13.0f * s,
+						listX + listW - 14.0f * s, ry + 10.0f * s, withAlpha(accentC, a), 1.0f, false);
+					const std::string details = flags + (folder.empty() ? "" : "  •  " + folder) +
+						(mount.empty() ? "" : "  •  " + (internal ? "Internal" : mount));
+					text(fit(details, 12.0f * s, listW - 28.0f * s),
+						12.0f * s, listX + 14.0f * s, ry + 33.0f * s, withAlpha(dimC, a), 0.0f, false);
+				}
+				text(confirmDumpDelete ? ("DELETE UNFINISHED DUMP " + dumpDeleteFolder + "? Cross = DELETE, Circle = Cancel") : dumpsMessage,
+					12.0f * s, listX, bodyY + bodyH - 22.0f * s, withAlpha(dimC, a), 0.0f, false);
+			}
+			hints({ { { G_DPAD_UD }, "Browse" }, { { G_CROSS }, "Refresh / Confirm" }, { { G_SQUARE }, "Delete unfinished" }, { { G_CIRCLE }, "Back / Cancel" } },
+				W * 0.5f, y0 + h - 25.0f * s, a);
 		}
 
 		// ---- settings

@@ -1051,6 +1051,7 @@ static void backup_paths(const char *title, char from[3][192], const char *names
     snprintf(from[2], 192, "%s", PLAYTIME_FILE);
 }
 
+
 static void backup_or_restore(int client, const char *title, int restore)
 {
     if (!valid_title(title))

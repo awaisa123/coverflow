@@ -16,6 +16,9 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 - Themes: six built in, your own picture/colours/font/music, and interface sounds
 - Header with clock and free storage; free space on every drive in Settings
 - USB backup and restore of settings, collections and play time
+- **v22 candidate:** Dump Game / App workflow with destination selection, confirmation, progress and result screens
+- Dump requests are handed to a separately installed PS5 App Dumper payload; a queued request is not proof that extraction completed
+- Manage Dumps screen (history/storage integration is still a work in progress)
 - Launcher status and log inside Settings
 - Updates itself from this repository's releases, every file checked with SHA-256
 
@@ -39,6 +42,40 @@ extract it and copy the `PPSA99123` folder to `/data/homebrew/` on the PS5 (with
 ShadowMountPlus). The folder already contains `cflaunch.elf`; Cover Flow loads its
 launcher through the payload loader on port 9021 whenever the running launcher is
 older or missing.
+
+## Dump Game / App (v22 candidate)
+
+The feature branch contains a Dump Game / App UI and an integration client for a
+separately installed PS5 App Dumper payload. It is not a self-contained dumper:
+Cover Flow looks for `ps5-app-dumper.elf`, loads it through the local payload
+loader when needed, discovers the dumper API, selects an available destination,
+and submits the selected title to the dumper's queue.
+
+### Workflow
+
+1. Select a title in Cover Flow and open its menu.
+2. Choose **Dump Game / App**.
+3. Select internal storage or a supported USB destination.
+4. Review the title and confirm the request.
+5. Follow the status/result screen. Progress is meaningful only when the external
+   dumper reports it; a queued request means accepted for processing, not completed.
+6. **Manage Dumps** currently has an empty-state screen; persistent dump-history
+   discovery and management actions are not yet connected.
+
+### Requirements and limitations
+
+- A compatible PS5 homebrew environment and a separately obtained, compatible
+  `ps5-app-dumper.elf` are required. This repository does not include that payload.
+- The payload loader must be available on port 9021 when the integration needs to
+  load the dumper. The dumper must expose the API expected by this branch.
+- A writable internal or USB destination must be reported by the dumper.
+- Compatibility varies by firmware and dumper build. If the payload or API is
+  unavailable, the UI should report an error rather than show fabricated success.
+- This is a **development candidate**. It has not been compiled or tested on a
+  console, and the Manage Dumps history is incomplete. Do not interpret the
+  presence of the menu as proof that a dump has completed successfully.
+
+See [docs/DUMP_GAME_APP.md](docs/DUMP_GAME_APP.md) for the integration notes.
 
 ## Your own covers and names
 Make a folder called `CoverFlowCovers` on a USB drive and put in it:
@@ -72,6 +109,7 @@ shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
+- **v22 (candidate, not yet released)** - Adds the Dump Game / App workflow, corrects queue submission to the upstream PS5 App Dumper API, polls real copied/total-byte progress and terminal queue state, and connects Manage Dumps to the dumper's `/api/dumps` history. The upstream dumper supports USB output only. This branch has not yet been compiled or console-tested.
 - **v17** - Your own names and covers (imported from USB, kept in Cover Flow's own
   folder, undo per game), Largest first sort, free space on every drive in Settings.
   Launcher 11 only accepts commands from the console itself, checks title ids
