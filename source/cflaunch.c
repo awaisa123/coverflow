@@ -1051,6 +1051,131 @@ static void backup_paths(const char *title, char from[3][192], const char *names
     snprintf(from[2], 192, "%s", PLAYTIME_FILE);
 }
 
+
+// ----------------------------------------------------------------- game/app file backup
+// Copies only files the running homebrew process can read. Symlinks are skipped
+// to avoid escaping the selected title tree. This is a file backup, not a
+// decrypted/reinstallable package; platform-protected files may be inaccessible.
+static int copy_tree_file(const char *from, const char *to)
+{
+    FILE *in = fopen(from, "rb");
+    if (in == NULL) return -1;
+    make_parents(to);
+    FILE *out = fopen(to, "wb");
+    if (out == NULL) { fclose(in); return -1; }
+    unsigned char buffer[1024 * 1024];
+    int result = 0;
+    for (;;) {
+        size_t got = fread(buffer, 1, sizeof(buffer), in);
+        if (got && fwrite(buffer, 1, got, out) != got) { result = -1; break; }
+        if (got < sizeof(buffer)) {
+            if (ferror(in)) result = -1;
+            break;
+        }
+    }
+    if (fclose(out) != 0) result = -1;
+    fclose(in);
+    if (result != 0) unlink(to);
+    return result;
+}
+
+static int copy_tree(const char *from, const char *to, int depth, long long *files, long long *bytes)
+{
+    if (depth > 64) return -1;
+    struct stat st;
+    if (lstat(from, &st) != 0) return -1;
+    if (S_ISLNK(st.st_mode)) return 0; // never follow links from inside a title
+    if (S_ISREG(st.st_mode)) {
+        if (copy_tree_file(from, to) != 0) return -1;
+        (*files)++;
+        *bytes += (long long)st.st_size;
+        return 0;
+    }
+    if (!S_ISDIR(st.st_mode)) return 0;
+    if (mkdir(to, 0777) != 0 && errno != EEXIST) return -1;
+    DIR *dir = opendir(from);
+    if (dir == NULL) return -1;
+    int result = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        char src[1024], dst[1024];
+        if (snprintf(src, sizeof(src), "%s/%s", from, entry->d_name) >= (int)sizeof(src) ||
+            snprintf(dst, sizeof(dst), "%s/%s", to, entry->d_name) >= (int)sizeof(dst)) {
+            result = -1; break;
+        }
+        if (copy_tree(src, dst, depth + 1, files, bytes) != 0) { result = -1; break; }
+    }
+    closedir(dir);
+    return result;
+}
+
+static void backup_game_app(int client, const char *title, const char *destination)
+{
+    if (!is_title_id(title) || destination == NULL ||
+        (strcmp(destination, "usb") != 0 && strcmp(destination, "internal") != 0)) {
+        reply(client, "err usage: game-backup <TITLEID> <usb|internal>");
+        return;
+    }
+
+    char source[256] = {0};
+    const char *const roots[] = {"/user/app", "/mnt/ext0/user/app", "/mnt/ext1/user/app", "/system_ex/app"};
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        char candidate[320];
+        snprintf(candidate, sizeof(candidate), "%s/%s", roots[i], title);
+        struct stat st;
+        if (stat(candidate, &st) == 0 && S_ISDIR(st.st_mode)) {
+            snprintf(source, sizeof(source), "%s", candidate);
+            break;
+        }
+    }
+    if (!source[0]) {
+        reply(client, "err no accessible installed app folder found for %s", title);
+        return;
+    }
+
+    char target[512] = {0};
+    if (strcmp(destination, "internal") == 0) {
+        snprintf(target, sizeof(target), "/data/homebrew/PPSA99123/backups/games/%s", title);
+    } else {
+        for (int u = 0; u < 8; u++) {
+            char drive[32], candidate[512];
+            snprintf(drive, sizeof(drive), "/mnt/usb%d", u);
+            if (!is_folder(drive)) continue;
+            snprintf(candidate, sizeof(candidate), "%s/CoverFlowGameBackups/%s", drive, title);
+            struct stat st;
+            if (lstat(candidate, &st) == 0) {
+                reply(client, "err backup already exists at %s; remove it first", candidate);
+                return;
+            }
+            if (access(drive, W_OK) == 0) {
+                snprintf(target, sizeof(target), "%s", candidate);
+                break;
+            }
+        }
+        if (!target[0]) {
+            reply(client, "err no writable USB drive found");
+            return;
+        }
+    }
+
+    struct stat existing;
+    if (lstat(target, &existing) == 0) {
+        reply(client, "err backup already exists at %s; remove it first", target);
+        return;
+    }
+    long long files = 0, bytes = 0;
+    log_line("cflaunch: backing up accessible files for %s from %s to %s", title, source, target);
+    if (copy_tree(source, target, 0, &files, &bytes) != 0 || files == 0) {
+        log_line("cflaunch: backup failed for %s after %lld files", title, files);
+        reply(client, "err backup incomplete; copied %lld files (%lld bytes) to %s", files, bytes, target);
+        return;
+    }
+    log_line("cflaunch: backup complete for %s: %lld files, %lld bytes at %s", title, files, bytes, target);
+    reply(client, "ok %s %lld %lld %s", target, files, bytes,
+          "file backup only; not a verified reinstallable package");
+}
+
 static void backup_or_restore(int client, const char *title, int restore)
 {
     if (!valid_title(title))
@@ -1797,6 +1922,11 @@ static int handle_command(int client, char *line)
     if (strcmp(command, "backup") == 0 || strcmp(command, "restore") == 0)
     {
         backup_or_restore(client, title, strcmp(command, "restore") == 0);
+        return 0;
+    }
+    if (strcmp(command, "game-backup") == 0)
+    {
+        backup_game_app(client, title, strtok(NULL, " \t"));
         return 0;
     }
     if (strcmp(command, "log") == 0)
