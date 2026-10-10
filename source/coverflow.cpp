@@ -222,7 +222,7 @@ public:
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
 	struct Pending;
 	struct DumperProgress;
-	bool dumpOpen{ false }; // Game/app file backup workflow
+	bool dumpOpen{ false }; // Real game/app dumping workflow
 	std::shared_ptr<DumperProgress> dumpJob;
 	std::string dumpResult;
 	bool dumpSucceeded{ false };
@@ -4404,7 +4404,7 @@ public:
 					text(dumpStatus.empty() ? "Waiting for dumper…" : dumpStatus, 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
 					text("Live progress comes from the dumper; keep the destination connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
 				} else {
-					text(dumpQueued ? "Queue accepted; this is not a completion confirmation." : (dumpSucceeded ? "Dumper reported a completed dump." : "The dumper did not confirm completion."), 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+					text(dumpQueued ? "Monitor the PS5 App Dumper web interface/log for progress." : (dumpSucceeded ? "Dumper reported a completed dump." : "The dumper did not confirm completion."), 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
 					std::string detail = dumpResult;
 					if (detail.size() > 100) detail = detail.substr(0, 97) + "...";
 					text(detail, 13.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
