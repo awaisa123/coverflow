@@ -21,8 +21,8 @@ LDLIBS := -lSceSystemService -lSceUserService -lSceNet -lSceSsl -lSceHttp2 -lSce
 
 all: $(ELF)
 
-$(ELF): main.c | $(OUTPUT)
-	$(CC) $(CFLAGS) -o $@ main.c $(LDLIBS)
+$(ELF): cflaunch.c | $(OUTPUT)
+	$(CC) $(CFLAGS) -o $@ cflaunch.c $(LDLIBS)
 
 $(OUTPUT):
 	mkdir -p $(OUTPUT)
