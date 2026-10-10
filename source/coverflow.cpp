@@ -4501,22 +4501,37 @@ public:
 				text("Submitting to PS5 App Dumper", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
 				text(dumpStatus.empty() ? "Preparing dumper…" : dumpStatus, 16.0f * s, rx, contentY + 36.0f * s,
 					muted, 0.0f, false);
-				const float barY = contentY + 88.0f * s, barH = 12.0f * s;
-				dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw, barY + barH),
-					IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
-				if (dumpProgress > 0.0f) dl->AddRectFilled(ImVec2(rx, barY),
-					ImVec2(rx + rw * dumpProgress, barY + barH), withAlpha(accentC, a), 6.0f * s);
-				const int percent = (int)(dumpProgress * 100.0f);
-				text(dumpProgress > 0.0f ? std::to_string(percent) + "% reported by dumper" : "Waiting for dumper acknowledgement",
-					15.0f * s, rx, barY + 22.0f * s, withAlpha(textC, a), 0.0f, false);
-				dl->AddRectFilled(ImVec2(rx, barY + 66.0f * s), ImVec2(rx + rw, barY + 122.0f * s),
+
+				// Match the prototype's circular progress treatment without inventing
+				// a percentage: the queue API does not expose extraction progress here.
+				const ImVec2 ringCenter(rx + rw * 0.5f, contentY + 139.0f * s);
+				const float ringRadius = 47.0f * s;
+				dl->AddCircle(ringCenter, ringRadius, IM_COL32(255, 255, 255, (int)(30 * a)), 64, 9.0f * s);
+				const float phase = (float)std::fmod(introTime * 3.2, 6.28318530718);
+				const ImVec2 spinnerDot(ringCenter.x + std::cos(phase) * ringRadius,
+					ringCenter.y + std::sin(phase) * ringRadius);
+				dl->AddCircleFilled(spinnerDot, 6.0f * s, withAlpha(accentC, a), 20);
+				text("…", 26.0f * s, ringCenter.x, ringCenter.y - 14.0f * s,
+					withAlpha(textC, a), 0.5f, false);
+				text("WAITING FOR QUEUE ACKNOWLEDGEMENT", 12.0f * s, rx, contentY + 202.0f * s,
+					muted, 0.0f, false);
+
+				const float statusY = contentY + 232.0f * s, rowH = 39.0f * s;
+				const char *statusLabels[] = { "Connect to dumper", "Check destination", "Queue selected title" };
+				for (int i = 0; i < 3; i++) {
+					const float sy = statusY + i * rowH;
+					dl->AddCircleFilled(ImVec2(rx + 8.0f * s, sy + 10.0f * s), 4.0f * s,
+						i == 0 ? withAlpha(accentC, a) : IM_COL32(80, 98, 124, (int)(220 * a)), 16);
+					text(statusLabels[i], 14.0f * s, rx + 22.0f * s, sy + 1.0f * s,
+						withAlpha(i == 0 ? textC : muted, a), 0.0f, false);
+				}
+				const float noteY = statusY + 3.0f * rowH + 2.0f * s;
+				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
 					IM_COL32(77, 67, 45, (int)(90 * a)), 8.0f * s);
-				text("KEEP DESTINATION CONNECTED", 12.0f * s, rx + 12.0f * s, barY + 75.0f * s,
+				text("NO FAKE PERCENTAGE", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s,
 					IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
-				text("Cover Flow will show a queued status if the dumper accepts.", 14.0f * s, rx + 12.0f * s,
-					barY + 96.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("For actual extraction progress, check the dumper's own web UI/log.", 14.0f * s, rx,
-					barY + 151.0f * s, muted, 0.0f, false);
+				text("Actual dump progress is in the dumper's web UI/log.", 14.0f * s, rx + 12.0f * s,
+					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
 			} else {
 				const bool success = dumpQueued || dumpSucceeded;
 				const ImU32 statusCol = success ? IM_COL32(112, 224, 172, (int)(255 * a)) : IM_COL32(255, 124, 140, (int)(255 * a));
