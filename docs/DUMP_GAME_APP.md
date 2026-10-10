@@ -75,3 +75,11 @@ does not replace that workflow.
 
 The external dumper payload is not bundled here. Use only content you are authorized
 to back up, and keep the external tool's license and compatibility requirements.
+
+## v22 review fixes
+
+- `source/cflaunch.Makefile` now builds `cflaunch.c` rather than a nonexistent `main.c` (the complete template and SDK are still required).
+- Before queueing, Cover Flow requires the dumper to report an idle queue. Live byte counters are shown only when the dumper job title ID matches the selected title and the queue item is dumping.
+- A completed dump with the same title ID in historical `/api/dumps` output is **not** evidence that the new request finished. A missing definitive queue result is shown as unverified.
+- Manage Dumps: select an unfinished, unused USB dump, press Square, then Cross to confirm deletion or Circle to cancel. This uses the dumper's `POST /api/dumps/delete` with `mount` and `folder`; the upstream API independently refuses completed dumps or deletion while busy. It does not delete completed backups.
+- These changes are source-only and have not been compiled or tested on PS5.
