@@ -3427,6 +3427,9 @@ public:
 		case 6:
 			manageDumpsOpen = true;
 			dumpOpen = false;
+			dumpEntries.clear();
+			dumpsIndex = 0;
+			refreshDumpHistory();
 			break;
 		default:
 			menuOpen = false;
@@ -3740,6 +3743,37 @@ public:
 			menuOpen = false;
 		}
 		if (menuOpen && manageDumpsOpen) {
+			if (dumpsJob) {
+				bool done = false, success = false;
+				std::string answer;
+				{
+					std::lock_guard<std::mutex> lock(dumpsJob->mutex);
+					done = dumpsJob->done;
+					success = dumpsJob->success;
+					answer = dumpsJob->answer;
+				}
+				if (done) {
+					if (success) {
+						dumpEntries = jsonObjectArray(answer, "dumps");
+						dumpsMessage = dumpEntries.empty() ? "No dumps found on the connected dumper." :
+							std::to_string(dumpEntries.size()) + " dump entries loaded.";
+					} else {
+						dumpsMessage = answer.empty() ? "Could not load dump history." : answer;
+						dumpEntries.clear();
+					}
+					dumpsJob.reset();
+					dumpsIndex = std::clamp(dumpsIndex, 0, std::max(0, (int)dumpEntries.size() - 1));
+				}
+			}
+			if (p.pressed & PAD_UP) {
+				if (!dumpEntries.empty()) dumpsIndex = (dumpsIndex + (int)dumpEntries.size() - 1) % (int)dumpEntries.size();
+			}
+			if (p.pressed & PAD_DOWN) {
+				if (!dumpEntries.empty()) dumpsIndex = (dumpsIndex + 1) % (int)dumpEntries.size();
+			}
+			if (p.pressed & PAD_CROSS) {
+				refreshDumpHistory();
+			}
 			if (p.pressed & PAD_CIRCLE) {
 				manageDumpsOpen = false;
 				circleHeld = -10.0f;
@@ -4677,17 +4711,47 @@ public:
 				IM_COL32(13, 22, 36, (int)(242 * a)), 12.0f * s);
 			dl->AddRect(ImVec2(x0 + pad, bodyY), ImVec2(x0 + w - pad, bodyY + bodyH),
 				IM_COL32(255, 255, 255, (int)(28 * a)), 12.0f * s, ImDrawCornerFlags_All, 1.0f * s);
-			const float cx = W * 0.5f, cy = bodyY + bodyH * 0.38f;
-			dl->AddRect(ImVec2(cx - 24.0f * s, cy - 17.0f * s), ImVec2(cx + 24.0f * s, cy + 17.0f * s),
-				withAlpha(accentC, a), 5.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-			dl->AddLine(ImVec2(cx - 12.0f * s, cy - 5.0f * s), ImVec2(cx + 12.0f * s, cy - 5.0f * s), withAlpha(accentC, a), 2.0f * s);
-			dl->AddLine(ImVec2(cx - 12.0f * s, cy + 4.0f * s), ImVec2(cx + 12.0f * s, cy + 4.0f * s), withAlpha(accentC, a), 2.0f * s);
-			text("No backup history available", 23.0f * s, cx, cy + 43.0f * s, withAlpha(textC, a), 0.5f, false);
-			text("Completed dumps will appear here when backup-history scanning is connected.",
-				15.0f * s, cx, cy + 77.0f * s, withAlpha(dimC, a), 0.5f, false);
-			text("No sample games or backup entries are shown as real data.", 13.0f * s, cx,
-				cy + 105.0f * s, withAlpha(dimC, a), 0.5f, false);
-			hints({ { { G_CIRCLE }, "Back" } }, W * 0.5f, y0 + h - 25.0f * s, a);
+			const float listX = x0 + pad + 20.0f * s;
+			const float listW = w - 2.0f * (pad + 20.0f * s);
+			const float rowH = 58.0f * s;
+			if (dumpEntries.empty()) {
+				const float cx = W * 0.5f, cy = bodyY + bodyH * 0.36f;
+				dl->AddRect(ImVec2(cx - 24.0f * s, cy - 17.0f * s), ImVec2(cx + 24.0f * s, cy + 17.0f * s),
+					withAlpha(accentC, a), 5.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+				dl->AddLine(ImVec2(cx - 12.0f * s, cy - 5.0f * s), ImVec2(cx + 12.0f * s, cy - 5.0f * s), withAlpha(accentC, a), 2.0f * s);
+				dl->AddLine(ImVec2(cx - 12.0f * s, cy + 4.0f * s), ImVec2(cx + 12.0f * s, cy + 4.0f * s), withAlpha(accentC, a), 2.0f * s);
+				text(dumpsMessage, 19.0f * s, cx, cy + 43.0f * s, withAlpha(textC, a), 0.5f, false);
+				text("Press Cross to refresh. History comes from PS5 App Dumper.", 14.0f * s, cx,
+					cy + 78.0f * s, withAlpha(dimC, a), 0.5f, false);
+			} else {
+				const int visibleRows = std::max(1, (int)((bodyH - 56.0f * s) / rowH));
+				const int start = std::max(0, std::min(dumpsIndex - visibleRows + 1, (int)dumpEntries.size() - visibleRows));
+				for (int i = start; i < (int)dumpEntries.size() && i < start + visibleRows; i++) {
+					const std::string &entry = dumpEntries[(size_t)i];
+					const float ry = bodyY + 12.0f * s + (i - start) * rowH;
+					if (i == dumpsIndex) {
+						dl->AddRectFilled(ImVec2(listX, ry), ImVec2(listX + listW, ry + rowH - 5.0f * s),
+							withAlpha(accentC, a * 0.28f), 8.0f * s);
+					}
+					const std::string title = jsonString(entry, "title");
+					const std::string titleId = jsonString(entry, "titleId");
+					const std::string folder = jsonString(entry, "folder");
+					const std::string mount = jsonString(entry, "mount");
+					const std::string state = jsonString(entry, "state");
+					const unsigned long long bytes = jsonNumber(entry, "bytes");
+					const std::string label = !title.empty() ? title : (!titleId.empty() ? titleId : folder);
+					text(fit(label, 19.0f * s, listW * 0.55f), 19.0f * s,
+						listX + 14.0f * s, ry + 7.0f * s, withAlpha(textC, a), 0.0f, false);
+					text((state.empty() || state == "done" ? "COMPLETE" : "INCOMPLETE") +
+						std::string("  •  ") + (bytes ? formatSize(bytes) : "size unavailable"), 13.0f * s,
+						listX + listW - 14.0f * s, ry + 10.0f * s, withAlpha(accentC, a), 1.0f, false);
+					text((titleId.empty() ? folder : titleId) + (mount.empty() ? "" : "  •  " + mount),
+						12.0f * s, listX + 14.0f * s, ry + 33.0f * s, withAlpha(dimC, a), 0.0f, false);
+				}
+				text(dumpsMessage, 12.0f * s, listX, bodyY + bodyH - 22.0f * s, withAlpha(dimC, a), 0.0f, false);
+			}
+			hints({ { { G_DPAD_UD }, "Browse" }, { { G_CROSS }, "Refresh" }, { { G_CIRCLE }, "Back" } },
+				W * 0.5f, y0 + h - 25.0f * s, a);
 		}
 
 		// ---- settings
