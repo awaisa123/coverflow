@@ -4056,11 +4056,6 @@ public:
 			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 52.0f * s;
 			const float rowY = y0 + 190.0f * s;
 			const std::string destination = dumpDestination == 0 ? "Internal storage" : "USB drive";
-			const std::string labels[3] = {
-				std::string("Destination:  ") + (dumpIndex == 0 ? destination : (dumpDestination == 0 ? "Internal storage" : "Internal storage")),
-				std::string("Destination:  ") + (dumpDestination == 1 ? "USB drive" : "USB drive"),
-				"Cancel"
-			};
 			for (int i = 0; i < 3; i++) {
 				const float ry = rowY + i * (rowH + 9.0f * s);
 				const bool on = i == dumpIndex;
