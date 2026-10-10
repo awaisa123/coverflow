@@ -4752,10 +4752,19 @@ public:
 				dl->AddCircleFilled(spinnerDot, 6.0f * s, withAlpha(accentC, a), 20);
 				text("…", 26.0f * s, ringCenter.x, ringCenter.y - 14.0f * s,
 					withAlpha(textC, a), 0.5f, false);
-				text("WAITING FOR QUEUE ACKNOWLEDGEMENT", 12.0f * s, rx, contentY + 202.0f * s,
-					muted, 0.0f, false);
+				const bool hasByteProgress = dumpProgress > 0.0f;
+				text(hasByteProgress ? (std::to_string((int)std::round(dumpProgress * 100.0f)) + "% COPIED")
+					: "WAITING FOR LIVE BYTE COUNTERS", 12.0f * s, rx, contentY + 202.0f * s,
+					hasByteProgress ? withAlpha(accentC, a) : muted, 0.0f, false);
+				const float barY = contentY + 218.0f * s;
+				dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw, barY + 8.0f * s),
+					IM_COL32(255, 255, 255, (int)(24 * a)), 4.0f * s);
+				if (hasByteProgress) {
+					dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw * std::clamp(dumpProgress, 0.0f, 1.0f), barY + 8.0f * s),
+						withAlpha(accentC, a), 4.0f * s);
+				}
 
-				const float statusY = contentY + 232.0f * s, rowH = 39.0f * s;
+				const float statusY = contentY + 242.0f * s, rowH = 39.0f * s;
 				const char *statusLabels[] = { "Connect to dumper", "Check destination", "Queue selected title" };
 				for (int i = 0; i < 3; i++) {
 					const float sy = statusY + i * rowH;
@@ -4767,9 +4776,9 @@ public:
 				const float noteY = statusY + 3.0f * rowH + 2.0f * s;
 				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
 					IM_COL32(77, 67, 45, (int)(90 * a)), 8.0f * s);
-				text("NO FAKE PERCENTAGE", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s,
+				text("LIVE DUMPER STATUS", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s,
 					IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
-				text("Actual dump progress is in the dumper's web UI/log.", 14.0f * s, rx + 12.0f * s,
+				text("Byte progress appears when the dumper reports copied and total bytes.", 13.0f * s, rx + 12.0f * s,
 					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
 			} else {
 				const bool success = dumpQueued || dumpSucceeded;
