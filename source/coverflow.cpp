@@ -560,6 +560,11 @@ public:
 		// PS5 App Dumper's documented queue API takes title IDs in q0/q1...
 		// fields, not a "titles" field. Queueing means accepted for later work,
 		// never that the files have already been copied.
+		const std::string beforeStatus = dumperHttp(port, "GET", "/api/status", "", 5);
+		if (beforeStatus.empty() || jsonTrue(jsonObjectValue(beforeStatus, "queue"), "active")) {
+			finishJob(false, false, "Dumper busy", "Cannot verify an idle dumper queue. Retry after it finishes.");
+			return;
+		}
 		const std::string form = "q0=" + urlEncode(titleId) +
 			"&target=" + urlEncode(target) + "&replace=0";
 		const std::string response = dumperHttp(port, "POST", "/api/queue/start", form, 10);
@@ -585,6 +590,7 @@ public:
 		// real copied/total byte progress and final per-title queue state; never
 		// turn a queue acknowledgement into a false "completed" result.
 		int idlePolls = 0;
+		bool observedOurQueue = false;
 		for (int attempt = 0; attempt < 43200; attempt++) {
 			sleep(1);
 			const std::string status = dumperHttp(port, "GET", "/api/status", "", 4);
@@ -609,12 +615,13 @@ public:
 					break;
 				}
 			}
+			if (!ourState.empty()) observedOurQueue = true;
 			{
 				std::lock_guard<std::mutex> lock(job->mutex);
-				if (total > 0 && (liveTitle.empty() || liveTitle == titleId))
+				if (total > 0 && liveTitle == titleId && ourState == "dumping")
 					job->progress = std::clamp((float)copied / (float)total, 0.0f, 1.0f);
 				if (!ourState.empty()) job->stage = ourState;
-				else if (!liveStage.empty() && (liveTitle.empty() || liveTitle == titleId)) job->stage = liveStage;
+				else if (!liveStage.empty() && liveTitle == titleId) job->stage = liveStage;
 				else job->stage = queueActive ? "Queue running" : "Checking final status";
 				if (!ourMessage.empty()) job->answer = ourMessage;
 			}
@@ -626,7 +633,7 @@ public:
 			idlePolls++;
 			if (idlePolls < 3) continue;
 
-			if (ourState == "done") {
+			if (observedOurQueue && ourState == "done") {
 				finishJob(true, false, "Complete",
 					"Dump completed for " + titleId + ". " +
 					(total > 0 ? ("Copied " + formatSize((long long)copied) + " of " + formatSize((long long)total) + ".") : "The dumper reported the title as complete."));
@@ -637,23 +644,9 @@ public:
 					ourMessage.empty() ? ("The dumper marked " + titleId + " as " + ourState + ".") : ourMessage);
 				return;
 			}
-			// Some dumper versions keep the last queue result only briefly. If
-			// the queue ended and the title is no longer listed, verify history.
-			const std::string history = dumperHttp(port, "GET", "/api/dumps", "", 8);
-			bool foundComplete = false;
-			for (const auto &entry : jsonObjectArray(history, "dumps")) {
-				if (jsonString(entry, "titleId") == titleId &&
-					(jsonString(entry, "state").empty() || jsonString(entry, "state") == "done")) {
-					foundComplete = true;
-					break;
-				}
-			}
-			if (foundComplete) {
-				finishJob(true, false, "Complete", "Dump history confirms completion for " + titleId + ".");
-			} else {
-				finishJob(false, false, "Result unavailable",
-					"The dumper queue stopped, but no completed result for " + titleId + " could be verified. Check the dumper log and Dumps page.");
-			}
+			finishJob(false, false, "Result unverified",
+				observedOurQueue ? "Queue ended without a definitive result. Check the dumper log." :
+				"The submitted title was not observed in the queue. Check the dumper log.");
 			return;
 		}
 		finishJob(false, false, "Timed out",
