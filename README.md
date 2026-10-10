@@ -6,13 +6,15 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 ## Features
 - Your installed games as a row of covers with reflections, or a grid (L3)
 - The selected game's artwork fades in behind the covers
-- Starts games, and can bring Cover Flow back when the game closes
-- Play time per game, with Recently played and Most played sorts
+- Starts games, and can bring Cover Flow back when the game closes (close the game,
+  don't just go Home: a game left running in the background stays open)
+- Play time per game, with Recently played, Most played and Largest first sorts
+- Your own names and covers, shown only in Cover Flow (the console's own data is never changed)
 - Favourites, hide, categories (PS5 / PS4 / Emulators / Homebrew) and six collections
 - Sort and filter, letter jump (L2/R2), fast scroll with the right stick
 - Details panel with size, install date, play time and storage location
 - Themes: six built in, your own picture/colours/font/music, and interface sounds
-- Header with clock and free storage
+- Header with clock and free storage; free space on every drive in Settings
 - USB backup and restore of settings, collections and play time
 - Launcher status and log inside Settings
 - Updates itself from this repository's releases, every file checked with SHA-256
@@ -32,19 +34,31 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 | Options + Share (held) | Quit (changeable in Settings) |
 
 ## Install
-Download `PPSA99123_v14.zip` from the [latest release](https://github.com/awaisa123/coverflow/releases/latest),
+Download `PPSA99123_vNN.zip` from the [latest release](https://github.com/awaisa123/coverflow/releases/latest),
 extract it and copy the `PPSA99123` folder to `/data/homebrew/` on the PS5 (with
 ShadowMountPlus). The folder already contains `cflaunch.elf`; Cover Flow loads its
 launcher through the payload loader on port 9021 whenever the running launcher is
 older or missing.
+
+## Your own covers and names
+Make a folder called `CoverFlowCovers` on a USB drive and put in it:
+- images named by title id, such as `PPSA01650.png` or `PPSA01650.jpg` (square
+  looks best, up to 8 MB each), and
+- optionally a `names.txt` with one game per line: `PPSA01650 | My name for it`.
+
+Plug the drive into the PS5 and choose Settings > Import covers and names from USB.
+They are copied into Cover Flow's own folder (`covers/custom/`), so the home screen
+and the console's data stay as they are. To undo one, open the game's menu
+(Triangle) > Use the original name and cover. Use art you made or have the right to
+use.
 
 ## Updating
 Settings > Check for updates. Cover Flow downloads `eboot.bin`, `cflaunch.elf` and
 `SHA256SUMS` from the latest release, checks every file, and only then replaces the
 old ones. It then closes itself: open it again from the home screen.
 
-Coming from v13: install v14 by hand once (v13's updater restarted itself, which
-could freeze the console).
+Coming from v15 or older: install v16 by hand once over FTP (older updaters left
+`eboot.bin` unstartable).
 
 ## Releases
 Each release has `eboot.bin`, `cflaunch.elf` and `SHA256SUMS` (used by the in-app
@@ -58,6 +72,18 @@ shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
+- **v17** - Your own names and covers (imported from USB, kept in Cover Flow's own
+  folder, undo per game), Largest first sort, free space on every drive in Settings.
+  Launcher 11 only accepts commands from the console itself, checks title ids
+  strictly, and fixes file permissions after a USB restore.
+- **v16** - Updates install files the console can start: the updater wrote
+  `eboot.bin` without the execute permission, so Cover Flow showed "Can't start the
+  game or app" (CE-107750-0) after updating. The launcher (10) now fixes permissions
+  and Cover Flow checks them before replacing anything.
+- **v15** - Game artwork now loads (Cover Flow read only the first piece of each
+  picture); artwork is also looked up in the game's own folder; return after a game
+  waits until the game has fully closed, checks Cover Flow really started and tries
+  once more if not (launcher 9).
 - **v14** - Updates and USB restores close Cover Flow instead of restarting it
   (the restart could freeze the console); launcher 8 refuses self-restarts.
 - **v13** - Game artwork backgrounds, play time and Recently played, grid view,
