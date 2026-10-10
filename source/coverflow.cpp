@@ -220,6 +220,9 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
+	bool dumpOpen{ false }; // the Dump Game / App UI (export backend deliberately not connected yet)
+	int dumpIndex{ 0 };
+	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
 	int collectionIndex{ 0 };
 	static constexpr int gridCols = 7;
 	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
@@ -3004,7 +3007,8 @@ public:
 		return { "Start game", isFavourite(g) ? "Remove from favourites" : "Add to favourites",
 			"Category:  " + categoryName(g.section) + (sectionOverride.count(g.titleId) ? "" : "  (automatic)"),
 			"Collections:  " + collectionSummary(g),
-			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow", "Close" };
+			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow",
+			"Dump Game / App", "Close" };
 	}
 
 	std::string collectionSummary(const Game &g) const
@@ -3094,6 +3098,11 @@ public:
 			}
 			saveSettings();
 			rebuildView();
+			break;
+		case 5:
+			dumpOpen = true;
+			dumpIndex = 0;
+			dumpDestination = 0;
 			break;
 		default:
 			menuOpen = false;
@@ -3398,12 +3407,37 @@ public:
 			menuIndex = 0;
 			categoryOpen = false;
 			collectionsOpen = false;
+			dumpOpen = false;
 			playSound(menuOpen ? 1 : 2);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
 		}
-		if (menuOpen && collectionsOpen) {
+		if (menuOpen && dumpOpen) {
+			if (p.pressed & PAD_UP) {
+				dumpIndex = (dumpIndex + 2) % 3;
+			}
+			if (p.pressed & PAD_DOWN) {
+				dumpIndex = (dumpIndex + 1) % 3;
+			}
+			if (p.pressed & PAD_CROSS) {
+				if (dumpIndex == 0) {
+					dumpDestination = 0;
+				} else if (dumpIndex == 1) {
+					dumpDestination = 1;
+				} else {
+					dumpOpen = false;
+					circleHeld = -10.0f;
+				}
+				if (dumpIndex < 2) {
+					showMessage(dumpIndex == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
+				}
+			}
+			if (p.pressed & PAD_CIRCLE) {
+				dumpOpen = false;
+				circleHeld = -10.0f;
+			}
+		} else if (menuOpen && collectionsOpen) {
 			if (p.pressed & PAD_UP) {
 				collectionIndex = (collectionIndex + collectionCount - 1) % collectionCount;
 			}
@@ -4005,6 +4039,48 @@ public:
 					}
 				}
 			}
+		}
+
+		// ---- Dump Game / App: UI scaffold only; no package extraction is performed
+		if (menuAnim > 0.01f && menuOpen && dumpOpen && current()) {
+			const Game &game = *current();
+			const float a = menuAnim, w = 900.0f * s, h = 610.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
+			panel(x0, y0, w, h, a);
+			const float pad = 36.0f * s;
+			text("Dump Game / App", 32.0f * s, x0 + pad, y0 + 26.0f * s, withAlpha(textC, a));
+			text(fit(game.title, 22.0f * s, w - pad * 2.0f), 22.0f * s, x0 + pad, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text("TITLE ID", 16.0f * s, x0 + pad, y0 + 120.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, x0 + pad, y0 + 145.0f * s, withAlpha(textC, a), 0.0f, false);
+
+			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 52.0f * s;
+			const float rowY = y0 + 190.0f * s;
+			const std::string destination = dumpDestination == 0 ? "Internal storage" : "USB drive";
+			const std::string labels[3] = {
+				std::string("Destination:  ") + (dumpIndex == 0 ? destination : (dumpDestination == 0 ? "Internal storage" : "Internal storage")),
+				std::string("Destination:  ") + (dumpDestination == 1 ? "USB drive" : "USB drive"),
+				"Cancel"
+			};
+			for (int i = 0; i < 3; i++) {
+				const float ry = rowY + i * (rowH + 9.0f * s);
+				const bool on = i == dumpIndex;
+				dl->AddRectFilled(ImVec2(rowX, ry), ImVec2(rowX + rowW, ry + rowH),
+					on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+				const std::string label = i == 0 ? std::string("Internal storage") : (i == 1 ? std::string("USB drive") : std::string("Cancel"));
+				text(label, 21.0f * s, rowX + 20.0f * s, ry + 14.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
+				if (i < 2 && dumpDestination == i) {
+					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 17.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
+				}
+			}
+			const float statusY = rowY + 3.0f * (rowH + 9.0f * s) + 16.0f * s;
+			text("Export progress", 18.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+			const float barY = statusY + 28.0f * s;
+			dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 12.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
+			text("0%  ·  Waiting for export support", 17.0f * s, rowX, barY + 22.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text("The interface is ready; the console export backend is not connected yet.", 16.0f * s, rowX, barY + 53.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text("No files will be copied in this UI-only stage.", 16.0f * s, rowX, barY + 78.0f * s, withAlpha(dimC, a), 0.0f, false);
+			hints({ { { G_DPAD_UD }, "Choose destination" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
+				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
 		}
 
 		// ---- settings
