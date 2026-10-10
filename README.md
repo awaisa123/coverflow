@@ -109,7 +109,7 @@ shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
-- **v22 (candidate, not yet released)** - Adds the Dump Game / App workflow, corrects queue submission to the upstream PS5 App Dumper API, and connects Manage Dumps to the dumper's real `/api/dumps` history. The upstream dumper supports USB output only; its web UI remains the source for live byte progress and final job status. This branch has not yet been compiled or console-tested.
+- **v22 (candidate, not yet released)** - Adds the Dump Game / App workflow, corrects queue submission to the upstream PS5 App Dumper API, polls real copied/total-byte progress and terminal queue state, and connects Manage Dumps to the dumper's `/api/dumps` history. The upstream dumper supports USB output only. This branch has not yet been compiled or console-tested.
 - **v17** - Your own names and covers (imported from USB, kept in Cover Flow's own
   folder, undo per game), Largest first sort, free space on every drive in Settings.
   Launcher 11 only accepts commands from the console itself, checks title ids
