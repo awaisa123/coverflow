@@ -220,7 +220,10 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
-	bool dumpOpen{ false }; // Dump Game / App workflow preview; never copies files
+	bool dumpOpen{ false }; // Game/app file backup workflow
+	std::shared_ptr<Pending> dumpJob;
+	std::string dumpResult;
+	bool dumpSucceeded{ false };
 	int dumpIndex{ 0 };
 	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
 	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: simulated progress, 3: preview result
@@ -3418,12 +3421,18 @@ public:
 			menuOpen = false;
 		}
 		if (menuOpen && dumpOpen) {
-			// The preview deliberately simulates progress only; it never touches game files.
+			// The launcher performs the file copy off the render thread.
 			if (dumpStage == 2) {
-				dumpProgress = std::min(1.0f, dumpProgress + dt * 0.35f);
-				if (dumpProgress >= 1.0f) {
+				std::string answer;
+				if (finished(dumpJob, answer)) {
+					dumpJob.reset();
+					dumpResult = answer;
+					dumpSucceeded = answer.rfind("ok ", 0) == 0;
+					dumpProgress = dumpSucceeded ? 1.0f : 0.0f;
 					dumpStage = 3;
 					dumpIndex = 0;
+				} else {
+					dumpProgress = std::fmod(dumpProgress + dt * 0.22f, 0.82f);
 				}
 			}
 			const int dumpItemCount = dumpStage == 0 ? 4 : (dumpStage == 1 || dumpStage == 3 ? 2 : 0);
@@ -3447,8 +3456,19 @@ public:
 					}
 				} else if (dumpStage == 1) {
 					if (dumpIndex == 0) {
-						dumpStage = 2;
-						dumpProgress = 0.0f;
+						const Game *selectedGame = current();
+						if (!selectedGame || !isTitleId(selectedGame->titleId)) {
+							dumpResult = "err selected item has no valid title ID";
+							dumpSucceeded = false;
+							dumpStage = 3;
+						} else {
+							dumpResult.clear();
+							dumpSucceeded = false;
+							dumpProgress = 0.0f;
+							dumpJob = askInBackground("game-backup " + selectedGame->titleId + " " +
+								(dumpDestination == 0 ? "internal" : "usb"), 3600);
+							dumpStage = 2;
+						}
 					} else {
 						dumpStage = 0;
 						dumpIndex = 0;
@@ -4114,21 +4134,27 @@ public:
 				text(dumpDestination == 0 ? "Internal storage" : "USB drive", 19.0f * s, rowX, statusY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
 				text("Choose where an export would be saved.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
 			} else if (dumpStage == 1) {
-				text("READY TO PREVIEW", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				text("READY TO BACK UP FILES", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
 				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("This is a UI demonstration only. No files will be read or written.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+				text("Copies files accessible to Cover Flow; not a reinstallable package.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
 			} else if (dumpStage == 2 || dumpStage == 3) {
-				text(dumpStage == 2 ? "SIMULATED EXPORT PROGRESS" : "PREVIEW COMPLETE", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				text(dumpStage == 2 ? "BACKING UP ACCESSIBLE FILES…" : (dumpSucceeded ? "BACKUP FINISHED" : "BACKUP FAILED"), 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
 				const float barY = statusY + 30.0f * s;
 				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
 				if (dumpProgress > 0.0f) {
 					dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW * dumpProgress, barY + 14.0f * s), withAlpha(accentC, a), 6.0f * s);
 				}
-				const int percent = (int)(dumpProgress * 100.0f);
-				text(std::to_string(percent) + "%  ·  " + (dumpStage == 2 ? "Simulating progress…" : "Preview finished"), 17.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("No game data was dumped. Export support is not connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+				if (dumpStage == 2) {
+					text("Copy is running on the console. Progress is indeterminate.", 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+					text("Please wait; do not unplug the destination drive.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+				} else {
+					text(dumpSucceeded ? "Backup command completed." : "No complete backup was confirmed.", 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+					std::string detail = dumpResult;
+					if (detail.size() > 100) detail = detail.substr(0, 97) + "...";
+					text(detail, 13.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+				}
 			}
-			const char *navigationHint = dumpStage == 2 ? "Circle: cancel preview" : "D-pad: navigate";
+			const char *navigationHint = dumpStage == 2 ? "Copy in progress" : "D-pad: navigate";
 			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
 				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
 		}
