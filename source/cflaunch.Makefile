@@ -12,7 +12,7 @@ endif
 
 include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 
-ROOT := $(abspath $(CURDIR)/..)
+ROOT := $(abspath $(CURDIR)/../..)
 OUTPUT := $(ROOT)/build/cflaunch
 ELF := $(OUTPUT)/cflaunch.elf
 
@@ -21,8 +21,8 @@ LDLIBS := -lSceSystemService -lSceUserService -lSceNet -lSceSsl -lSceHttp2 -lSce
 
 all: $(ELF)
 
-$(ELF): cflaunch.c | $(OUTPUT)
-	$(CC) $(CFLAGS) -o $@ cflaunch.c $(LDLIBS)
+$(ELF): main.c | $(OUTPUT)
+	$(CC) $(CFLAGS) -o $@ main.c $(LDLIBS)
 
 $(OUTPUT):
 	mkdir -p $(OUTPUT)
