@@ -3779,7 +3779,7 @@ public:
 				circleHeld = -10.0f;
 			}
 		} else if (menuOpen && dumpOpen) {
-			// The external PS5 App Dumper reports real byte progress off the render thread.
+			// Queue acceptance and status are read from the external dumper job off the render thread.
 			if (dumpStage == 2 && dumpJob) {
 				bool done = false, success = false, queued = false;
 				std::string answer, stage;
