@@ -229,6 +229,9 @@ public:
 	bool dumpSucceeded{ false };
 	bool dumpQueued{ false };
 	std::shared_ptr<DumperProgress> dumpsJob;
+	std::shared_ptr<DumperProgress> dumpDeleteJob;
+	bool confirmDumpDelete{ false };
+	std::string dumpDeleteFolder, dumpDeleteMount;
 	std::vector<std::string> dumpEntries;
 	std::string dumpsMessage{ "Press Cross to refresh dump history." };
 	int dumpsIndex{ 0 };
@@ -682,6 +685,26 @@ public:
 			job->stage = job->success ? "History loaded" : "History unavailable";
 			job->answer = response.empty() ? "The dumper returned no response." :
 				(job->success ? response : "The dumper did not return a dumps list. Check its API/version.");
+		}).detach();
+	}
+
+	void deleteIncompleteDump()
+	{
+		if (dumpDeleteJob || dumpDeleteFolder.empty() || dumpDeleteMount.empty()) return;
+		const std::string mount = dumpDeleteMount, folder = dumpDeleteFolder;
+		confirmDumpDelete = false;
+		dumpDeleteJob = std::make_shared<DumperProgress>();
+		const auto job = dumpDeleteJob;
+		dumpsMessage = "Requesting deletion of unfinished dump…";
+		std::thread([job, mount, folder]() {
+			const int port = findDumperPort();
+			const std::string form = "mount=" + urlEncode(mount) + "&folder=" + urlEncode(folder);
+			const std::string response = port ? dumperHttp(port, "POST", "/api/dumps/delete", form, 15) : "";
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = true;
+			job->success = response.find("\"deleted\":true") != std::string::npos;
+			job->answer = job->success ? "Unfinished dump deleted." :
+				"Delete refused or dumper unavailable. Only unfinished dumps can be removed.";
 		}).detach();
 	}
 
@@ -3868,6 +3891,25 @@ public:
 					dumpsIndex = std::clamp(dumpsIndex, 0, std::max(0, (int)dumpEntries.size() - 1));
 				}
 			}
+			if (dumpDeleteJob) {
+				bool done = false, success = false;
+				std::string answer;
+				{
+					std::lock_guard<std::mutex> lock(dumpDeleteJob->mutex);
+					done = dumpDeleteJob->done;
+					success = dumpDeleteJob->success;
+					answer = dumpDeleteJob->answer;
+				}
+				if (done) {
+					dumpDeleteJob.reset();
+					dumpsMessage = answer;
+					if (success) refreshDumpHistory();
+				}
+			}
+			if (confirmDumpDelete) {
+				if (p.pressed & PAD_CROSS) deleteIncompleteDump();
+				else if (p.pressed & PAD_CIRCLE) confirmDumpDelete = false;
+			} else {
 			if (p.pressed & PAD_UP) {
 				if (!dumpEntries.empty()) dumpsIndex = (dumpsIndex + (int)dumpEntries.size() - 1) % (int)dumpEntries.size();
 			}
@@ -3877,9 +3919,19 @@ public:
 			if (p.pressed & PAD_CROSS) {
 				refreshDumpHistory();
 			}
+			if ((p.pressed & PAD_SQUARE) && !dumpsJob && !dumpDeleteJob && !dumpEntries.empty()) {
+				const std::string &entry = dumpEntries[(size_t)dumpsIndex];
+				if (jsonString(entry, "state") == "incomplete" &&
+					!jsonTrue(entry, "inUse") && !jsonTrue(entry, "internal")) {
+					dumpDeleteFolder = jsonString(entry, "folder");
+					dumpDeleteMount = jsonString(entry, "mount");
+					confirmDumpDelete = !dumpDeleteFolder.empty() && !dumpDeleteMount.empty();
+				} else dumpsMessage = "Only unused, unfinished USB dumps can be deleted.";
+			}
 			if (p.pressed & PAD_CIRCLE) {
 				manageDumpsOpen = false;
 				circleHeld = -10.0f;
+			}
 			}
 		} else if (menuOpen && dumpOpen) {
 			// Queue acceptance and status are read from the external dumper job off the render thread.
@@ -4873,9 +4925,10 @@ public:
 					text(fit(details, 12.0f * s, listW - 28.0f * s),
 						12.0f * s, listX + 14.0f * s, ry + 33.0f * s, withAlpha(dimC, a), 0.0f, false);
 				}
-				text(dumpsMessage, 12.0f * s, listX, bodyY + bodyH - 22.0f * s, withAlpha(dimC, a), 0.0f, false);
+				text(confirmDumpDelete ? ("DELETE UNFINISHED DUMP " + dumpDeleteFolder + "? Cross = DELETE, Circle = Cancel") : dumpsMessage,
+					12.0f * s, listX, bodyY + bodyH - 22.0f * s, withAlpha(dimC, a), 0.0f, false);
 			}
-			hints({ { { G_DPAD_UD }, "Browse" }, { { G_CROSS }, "Refresh" }, { { G_CIRCLE }, "Back" } },
+			hints({ { { G_DPAD_UD }, "Browse" }, { { G_CROSS }, "Refresh / Confirm" }, { { G_SQUARE }, "Delete unfinished" }, { { G_CIRCLE }, "Back / Cancel" } },
 				W * 0.5f, y0 + h - 25.0f * s, a);
 		}
 
