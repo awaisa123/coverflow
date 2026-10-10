@@ -12,12 +12,18 @@ not a claim that a PS5 dump has been completed or that this candidate is release
   `source/coverflow.cpp`.
 - The client looks for a separately installed `ps5-app-dumper.elf`, attempts to
   load it using the configured local payload loader when needed, discovers the
-  dumper API, asks it for available devices, selects a destination, and submits
-  the selected title to the dumper queue.
-- Progress/status shown by the UI comes from the integration job state. A queued
-  response is represented separately from completed extraction.
-- Manage Dumps currently renders an empty state. Persistent history scanning,
-  backup metadata, delete/export actions, and per-entry details are not connected.
+  dumper API, asks it for available devices, selects a writable USB destination,
+  and submits the selected title to the dumper queue using the documented
+  `q0`, `target`, and `replace` fields.
+- The client treats queue acceptance as **Queued**, not completed. The external
+  dumper may launch the selected title and close Cover Flow, so live byte-level
+  progress and final completion must currently be followed in the dumper's own
+  web interface.
+- Manage Dumps now requests `GET /api/dumps` and renders real entries returned
+  by the external dumper, including title ID/name, output folder, destination,
+  state, and size when supplied. The screen can refresh and browse the list.
+- Delete/export/rename actions are not connected in Cover Flow. In particular,
+  do not present queue acceptance as proof that a finished dump exists.
 
 ## Expected setup
 
@@ -48,10 +54,10 @@ not a claim that a PS5 dump has been completed or that this candidate is release
 - Build the main app and launcher in the intended PS5 Vulkan Template environment.
 - Confirm the exact dumper API and queue/result semantics against the compatible
   external dumper version.
-- Connect Manage Dumps to persistent history supplied by the backend, including
-  destination, title ID/name, size, date, and final status.
-- Implement supported management actions only after the backend defines safe
-  operations and validates their paths.
+- Add safe management actions only after the backend's constraints are explicit.
+  The upstream delete endpoint only removes incomplete dumps; it must not be
+  exposed as a generic delete for completed dump folders.
+- Display timestamps and richer job metadata if the external API exposes them.
 - Test cancel/error/retry paths and verify that UI status matches backend status.
 - Produce new release artifacts and checksums only from the successful build outputs.
 
