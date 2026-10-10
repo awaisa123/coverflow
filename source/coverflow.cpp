@@ -4863,13 +4863,21 @@ public:
 					const std::string mount = jsonString(entry, "mount");
 					const std::string state = jsonString(entry, "state");
 					const unsigned long long bytes = jsonNumber(entry, "bytes");
+					const bool internal = jsonTrue(entry, "internal");
+					const bool inUse = jsonTrue(entry, "inUse");
+					const bool fself = jsonNumber(entry, "fself") != 0;
 					const std::string label = !title.empty() ? title : (!titleId.empty() ? titleId : folder);
 					text(fit(label, 19.0f * s, listW * 0.55f), 19.0f * s,
 						listX + 14.0f * s, ry + 7.0f * s, withAlpha(textC, a), 0.0f, false);
+					std::string flags = titleId.rfind("CUSA", 0) == 0 ? "PS4" : "PS5";
+					if (fself) flags += "  •  FSELF";
+					if (inUse) flags += "  •  IN USE";
 					text((state.empty() || state == "done" ? "COMPLETE" : "INCOMPLETE") +
 						std::string("  •  ") + (bytes ? formatSize(bytes) : "size unavailable"), 13.0f * s,
 						listX + listW - 14.0f * s, ry + 10.0f * s, withAlpha(accentC, a), 1.0f, false);
-					text((titleId.empty() ? folder : titleId) + (mount.empty() ? "" : "  •  " + mount),
+					const std::string details = flags + (folder.empty() ? "" : "  •  " + folder) +
+						(mount.empty() ? "" : "  •  " + (internal ? "Internal" : mount));
+					text(fit(details, 12.0f * s, listW - 28.0f * s),
 						12.0f * s, listX + 14.0f * s, ry + 33.0f * s, withAlpha(dimC, a), 0.0f, false);
 				}
 				text(dumpsMessage, 12.0f * s, listX, bodyY + bodyH - 22.0f * s, withAlpha(dimC, a), 0.0f, false);
