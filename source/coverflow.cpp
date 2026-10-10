@@ -220,9 +220,11 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
-	bool dumpOpen{ false }; // the Dump Game / App UI (export backend deliberately not connected yet)
+	bool dumpOpen{ false }; // Dump Game / App workflow preview; never copies files
 	int dumpIndex{ 0 };
 	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
+	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: simulated progress, 3: preview result
+	float dumpProgress{ 0.0f };
 	int collectionIndex{ 0 };
 	static constexpr int gridCols = 7;
 	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
@@ -3103,6 +3105,8 @@ public:
 			dumpOpen = true;
 			dumpIndex = 0;
 			dumpDestination = 0;
+			dumpStage = 0;
+			dumpProgress = 0.0f;
 			break;
 		default:
 			menuOpen = false;
@@ -3414,27 +3418,58 @@ public:
 			menuOpen = false;
 		}
 		if (menuOpen && dumpOpen) {
-			if (p.pressed & PAD_UP) {
-				dumpIndex = (dumpIndex + 2) % 3;
+			// The preview deliberately simulates progress only; it never touches game files.
+			if (dumpStage == 2) {
+				dumpProgress = std::min(1.0f, dumpProgress + dt * 0.35f);
+				if (dumpProgress >= 1.0f) {
+					dumpStage = 3;
+					dumpIndex = 0;
+				}
 			}
-			if (p.pressed & PAD_DOWN) {
-				dumpIndex = (dumpIndex + 1) % 3;
+			const int dumpItemCount = dumpStage == 0 ? 4 : (dumpStage == 1 || dumpStage == 3 ? 2 : 0);
+			if (dumpItemCount > 0 && (p.pressed & PAD_UP)) {
+				dumpIndex = (dumpIndex + dumpItemCount - 1) % dumpItemCount;
+			}
+			if (dumpItemCount > 0 && (p.pressed & PAD_DOWN)) {
+				dumpIndex = (dumpIndex + 1) % dumpItemCount;
 			}
 			if (p.pressed & PAD_CROSS) {
-				if (dumpIndex == 0) {
-					dumpDestination = 0;
-				} else if (dumpIndex == 1) {
-					dumpDestination = 1;
-				} else {
-					dumpOpen = false;
-					circleHeld = -10.0f;
-				}
-				if (dumpIndex < 2) {
-					showMessage(dumpIndex == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
+				if (dumpStage == 0) {
+					if (dumpIndex < 2) {
+						dumpDestination = dumpIndex;
+						showMessage(dumpDestination == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
+					} else if (dumpIndex == 2) {
+						dumpStage = 1;
+						dumpIndex = 0;
+					} else {
+						dumpOpen = false;
+						circleHeld = -10.0f;
+					}
+				} else if (dumpStage == 1) {
+					if (dumpIndex == 0) {
+						dumpStage = 2;
+						dumpProgress = 0.0f;
+					} else {
+						dumpStage = 0;
+						dumpIndex = 0;
+					}
+				} else if (dumpStage == 3) {
+					if (dumpIndex == 0) {
+						dumpStage = 0;
+						dumpIndex = 0;
+					} else {
+						dumpOpen = false;
+						circleHeld = -10.0f;
+					}
 				}
 			}
 			if (p.pressed & PAD_CIRCLE) {
-				dumpOpen = false;
+				if (dumpStage == 1 || dumpStage == 3) {
+					dumpStage = 0;
+					dumpIndex = 0;
+				} else {
+					dumpOpen = false;
+				}
 				circleHeld = -10.0f;
 			}
 		} else if (menuOpen && collectionsOpen) {
@@ -4041,40 +4076,60 @@ public:
 			}
 		}
 
-		// ---- Dump Game / App: UI scaffold only; no package extraction is performed
+		// ---- Dump Game / App: complete navigable UI preview; no package extraction or file copying
 		if (menuAnim > 0.01f && menuOpen && dumpOpen && current()) {
 			const Game &game = *current();
 			const float a = menuAnim, w = 900.0f * s, h = 610.0f * s;
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
 			panel(x0, y0, w, h, a);
 			const float pad = 36.0f * s;
-			text("Dump Game / App", 32.0f * s, x0 + pad, y0 + 26.0f * s, withAlpha(textC, a));
-			text(fit(game.title, 22.0f * s, w - pad * 2.0f), 22.0f * s, x0 + pad, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("TITLE ID", 16.0f * s, x0 + pad, y0 + 120.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, x0 + pad, y0 + 145.0f * s, withAlpha(textC, a), 0.0f, false);
+			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 48.0f * s;
+			text("Dump Game / App", 32.0f * s, rowX, y0 + 26.0f * s, withAlpha(textC, a));
+			text(fit(game.title, 22.0f * s, rowW), 22.0f * s, rowX, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text("TITLE ID", 16.0f * s, rowX, y0 + 112.0f * s, withAlpha(dimC, a), 0.0f, false);
+			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, rowX, y0 + 136.0f * s, withAlpha(textC, a), 0.0f, false);
 
-			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 52.0f * s;
-			const float rowY = y0 + 190.0f * s;
-			const std::string destination = dumpDestination == 0 ? "Internal storage" : "USB drive";
-			for (int i = 0; i < 3; i++) {
-				const float ry = rowY + i * (rowH + 9.0f * s);
+			const float rowY = y0 + 172.0f * s;
+			std::vector<std::string> dumpLabels;
+			if (dumpStage == 0) {
+				dumpLabels = { "Internal storage", "USB drive", "Continue", "Cancel" };
+			} else if (dumpStage == 1) {
+				dumpLabels = { "Run UI preview", "Back to destination" };
+			} else if (dumpStage == 3) {
+				dumpLabels = { "Choose another destination", "Close" };
+			}
+			for (int i = 0; i < (int)dumpLabels.size(); i++) {
+				const float ry = rowY + i * (rowH + 7.0f * s);
 				const bool on = i == dumpIndex;
 				dl->AddRectFilled(ImVec2(rowX, ry), ImVec2(rowX + rowW, ry + rowH),
 					on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
-				const std::string label = i == 0 ? std::string("Internal storage") : (i == 1 ? std::string("USB drive") : std::string("Cancel"));
-				text(label, 21.0f * s, rowX + 20.0f * s, ry + 14.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				if (i < 2 && dumpDestination == i) {
-					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 17.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
+				text(dumpLabels[i], 20.0f * s, rowX + 20.0f * s, ry + 12.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
+				if (dumpStage == 0 && i < 2 && dumpDestination == i) {
+					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 15.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
 				}
 			}
-			const float statusY = rowY + 3.0f * (rowH + 9.0f * s) + 16.0f * s;
-			text("Export progress", 18.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-			const float barY = statusY + 28.0f * s;
-			dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 12.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
-			text("0%  ·  Waiting for export support", 17.0f * s, rowX, barY + 22.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("The interface is ready; the console export backend is not connected yet.", 16.0f * s, rowX, barY + 53.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("No files will be copied in this UI-only stage.", 16.0f * s, rowX, barY + 78.0f * s, withAlpha(dimC, a), 0.0f, false);
-			hints({ { { G_DPAD_UD }, "Choose destination" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
+			const float statusY = y0 + 398.0f * s;
+			if (dumpStage == 0) {
+				text("DESTINATION", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				text(dumpDestination == 0 ? "Internal storage" : "USB drive", 19.0f * s, rowX, statusY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("Choose where an export would be saved.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+			} else if (dumpStage == 1) {
+				text("READY TO PREVIEW", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("This is a UI demonstration only. No files will be read or written.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+			} else if (dumpStage == 2 || dumpStage == 3) {
+				text(dumpStage == 2 ? "SIMULATED EXPORT PROGRESS" : "PREVIEW COMPLETE", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				const float barY = statusY + 30.0f * s;
+				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
+				if (dumpProgress > 0.0f) {
+					dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW * dumpProgress, barY + 14.0f * s), withAlpha(accentC, a), 6.0f * s);
+				}
+				const int percent = (int)(dumpProgress * 100.0f);
+				text(std::to_string(percent) + "%  ·  " + (dumpStage == 2 ? "Simulating progress…" : "Preview finished"), 17.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("No game data was dumped. Export support is not connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
+			}
+			const char *navigationHint = dumpStage == 2 ? "Circle: cancel preview" : "D-pad: navigate";
+			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
 				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
 		}
 
