@@ -220,6 +220,7 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
+	struct Pending;
 	bool dumpOpen{ false }; // Game/app file backup workflow
 	std::shared_ptr<Pending> dumpJob;
 	std::string dumpResult;
