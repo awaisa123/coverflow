@@ -72,6 +72,7 @@ shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
+- **v22 (candidate, not yet released)** - Adds a Dump Game / App workflow that hands dumping off to the external PS5 App Dumper payload and submits selected titles to its queue. Requires a compatible jailbroken PS5, the external payload and a PS5 SDK build/test; this branch has not yet been compiled or console-tested. A queued request is not proof of dump completion.
 - **v17** - Your own names and covers (imported from USB, kept in Cover Flow's own
   folder, undo per game), Largest first sort, free space on every drive in Settings.
   Launcher 11 only accepts commands from the console itself, checks title ids
