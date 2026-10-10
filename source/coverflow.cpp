@@ -226,6 +226,7 @@ public:
 	std::shared_ptr<DumperProgress> dumpJob;
 	std::string dumpResult;
 	bool dumpSucceeded{ false };
+	bool dumpQueued{ false };
 	int dumpIndex{ 0 };
 	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
 	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: dumping, 3: result
@@ -279,6 +280,7 @@ public:
 		std::mutex mutex;
 		bool done{ false };
 		bool success{ false };
+		bool queued{ false };
 		float progress{ 0.0f };
 		std::string stage{ "Starting dumper" };
 		std::string answer;
@@ -430,23 +432,34 @@ public:
 	static void runDumperBackend(const std::shared_ptr<DumperProgress> &job,
 		const std::string &titleId, bool internal, const std::string &payloadPath)
 	{
-		auto setStatus = [&](const std::string &stage) {
-			std::lock_guard<std::mutex> lock(job->mutex);
-			job->stage = stage;
-		};
-		auto finishJob = [&](bool success, const std::string &answer) {
+		auto finishJob = [&](bool success, bool queued, const std::string &stage, const std::string &answer) {
 			std::lock_guard<std::mutex> lock(job->mutex);
 			job->success = success;
+			job->queued = queued;
 			job->done = true;
-			job->progress = success ? 1.0f : job->progress;
+			job->stage = stage;
+			job->progress = success ? 0.0f : job->progress;
 			job->answer = answer;
 		};
 
 		int port = findDumperPort();
 		if (!port) {
-			setStatus("Loading PS5 App Dumper payload");
-			if (!sendPayload(payloadPath)) {
-				finishJob(false, "Dumper payload not found or payload loader on port 9021 is unavailable. Install ps5-app-dumper.elf in the Cover Flow homebrew folder.");
+			// Try the configured payload path and common homebrew locations.
+			std::vector<std::string> candidates = {
+				payloadPath,
+				"/data/homebrew/PPSA99123/ps5-app-dumper.elf",
+				"/mnt/usb0/homebrew/ps5-app-dumper.elf",
+				"/mnt/usb1/homebrew/ps5-app-dumper.elf",
+				"/mnt/usb0/ps5-app-dumper/ps5-app-dumper.elf",
+				"/mnt/usb1/ps5-app-dumper/ps5-app-dumper.elf"
+			};
+			bool sent = false;
+			for (const auto &candidate : candidates) {
+				if (!candidate.empty() && sendPayload(candidate)) { sent = true; break; }
+			}
+			if (!sent) {
+				finishJob(false, false, "Payload unavailable",
+					"Dumper payload not found or payload loader on port 9021 is unavailable. Install ps5-app-dumper.elf and ensure elfldr is running.");
 				return;
 			}
 			for (int attempt = 0; attempt < 40 && !port; attempt++) {
@@ -455,65 +468,40 @@ public:
 			}
 		}
 		if (!port) {
-			finishJob(false, "PS5 App Dumper did not start. Check its payload log and firmware compatibility.");
+			finishJob(false, false, "Dumper unavailable",
+				"PS5 App Dumper did not start. Check payload logs and firmware compatibility.");
 			return;
 		}
 
-		setStatus("Checking destination space");
 		const std::string devices = dumperHttp(port, "GET", "/api/devices", "", 5);
 		if (devices.empty()) {
-			finishJob(false, "Could not read PS5 App Dumper devices.");
+			finishJob(false, false, "Dumper unavailable", "Could not read PS5 App Dumper devices.");
 			return;
 		}
 		const std::string target = chooseDumperTarget(devices, internal);
 		if (target.empty()) {
-			finishJob(false, internal ? "No writable internal destination is available." : "No writable USB drive found. Connect a supported USB drive and retry.");
+			finishJob(false, false, "Destination unavailable",
+				internal ? "No writable internal destination is available." :
+				"No writable USB drive found. Connect a supported USB drive and retry.");
 			return;
 		}
 
-		setStatus("Starting dump");
-		const std::string app = titleId + "-app0";
-		const std::string form = "app=" + urlEncode(app) + "&target=" + urlEncode(target);
-		const std::string started = dumperHttp(port, "POST", "/api/dump", form, 10);
-		if (started.empty() || started.find("\"started\":true") == std::string::npos) {
-			std::string err = jsonString(started, "error");
-			if (err.empty()) err = "Dumper refused the request: " + started;
-			finishJob(false, err);
+		// A proper dump needs the selected title mounted. Cover Flow cannot stay
+		// on screen while the PS5 launches that game, so submit the dumper's own
+		// queue API; its worker launches/mounts the title and runs the dump.
+		const std::string form = "titles=" + urlEncode(titleId) +
+			"&target=" + urlEncode(target) + "&replace=0";
+		const std::string response = dumperHttp(port, "POST", "/api/queue/start", form, 10);
+		if (response.find("\\"started\\":true") == std::string::npos) {
+			std::string err = jsonString(response, "error");
+			if (err.empty()) err = response.empty() ?
+				"PS5 App Dumper did not accept the queue request." : response;
+			finishJob(false, false, "Queue rejected", err);
 			return;
 		}
-
-		for (int attempt = 0; attempt < 7200; attempt++) {
-			const std::string status = dumperHttp(port, "GET", "/api/status", "", 5);
-			if (status.empty()) {
-				setStatus("Waiting for dumper status");
-			} else {
-				const std::string jobJson = status.substr(status.find("\"job\":") == std::string::npos ? 0 : status.find("\"job\":"));
-				const std::string state = jsonString(jobJson, "state");
-				const std::string stage = jsonString(jobJson, "stage");
-				const std::string message = jsonString(jobJson, "message");
-				const unsigned long long total = jsonNumber(jobJson, "totalBytes");
-				const unsigned long long copied = jsonNumber(jobJson, "copiedBytes");
-				{
-					std::lock_guard<std::mutex> lock(job->mutex);
-					job->stage = stage.empty() ? "Dumping" : stage;
-					if (!message.empty()) job->answer = message;
-					if (total > 0) {
-						float value = (float)((double)copied / (double)total);
-						job->progress = std::max(0.0f, std::min(0.99f, value));
-					}
-				}
-				if (state == "done") {
-					finishJob(true, message.empty() ? "Dump completed: " + target : message);
-					return;
-				}
-				if (state == "failed" || state == "aborted") {
-					finishJob(false, message.empty() ? "Dump ended with state: " + state : message);
-					return;
-				}
-			}
-			usleep(1000000);
-		}
-		finishJob(false, "Timed out waiting for the dumper. Check the dumper log before retrying.");
+		finishJob(true, true, "Queued",
+			"Dump queued for " + titleId + " at " + target +
+			". The dumper will launch the title; Cover Flow may close. Monitor progress in the PS5 App Dumper web interface.");
 	}
 
 	std::shared_ptr<Pending> updateCheckJob, updateApplyJob;
@@ -3683,7 +3671,8 @@ public:
 				if (done) {
 					dumpResult = answer;
 					dumpSucceeded = success;
-					dumpProgress = dumpSucceeded ? 1.0f : dumpProgress;
+					dumpQueued = dumpJob->queued;
+					dumpProgress = dumpSucceeded ? (dumpQueued ? 0.0f : 1.0f) : dumpProgress;
 					dumpJob.reset();
 					dumpStage = 3;
 					dumpIndex = 0;
@@ -3718,6 +3707,7 @@ public:
 						} else {
 							dumpResult.clear();
 							dumpSucceeded = false;
+							dumpQueued = false;
 							dumpProgress = 0.0f;
 							dumpJob = std::make_shared<DumperProgress>();
 							dumpStatus = "Preparing real PS5 dump";
@@ -4403,7 +4393,7 @@ public:
 				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
 				text("Uses the external PS5 App Dumper payload to create a game dump.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
 			} else if (dumpStage == 2 || dumpStage == 3) {
-				text(dumpStage == 2 ? "DUMPING GAME / APP…" : (dumpSucceeded ? "DUMP FINISHED" : "DUMP FAILED"), 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
+				text(dumpStage == 2 ? "SUBMITTING GAME / APP DUMP…" : (dumpQueued ? "DUMP QUEUED" : (dumpSucceeded ? "DUMP FINISHED" : "DUMP FAILED")), 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
 				const float barY = statusY + 30.0f * s;
 				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
 				if (dumpProgress > 0.0f) {
@@ -4413,7 +4403,7 @@ public:
 					text(dumpStatus.empty() ? "Waiting for dumper…" : dumpStatus, 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
 					text("Live progress comes from the dumper; keep the destination connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
 				} else {
-					text(dumpSucceeded ? "Dumper reported a completed dump." : "The dumper did not confirm completion.", 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
+					text(dumpQueued ? "Queue accepted; this is not a completion confirmation." : (dumpSucceeded ? "Dumper reported a completed dump." : "The dumper did not confirm completion."), 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
 					std::string detail = dumpResult;
 					if (detail.size() > 100) detail = detail.substr(0, 97) + "...";
 					text(detail, 13.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
