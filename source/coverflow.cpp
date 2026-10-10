@@ -163,7 +163,7 @@ struct Sha256 {
 	}
 };
 
-static constexpr const char *coverFlowVersion = "v22";
+static constexpr const char *coverFlowVersion = "v21";
 static constexpr int launcherVersion = 12; // the launcher in the title folder
 
 class VulkanExample : public VulkanExampleBase
@@ -279,16 +279,6 @@ public:
 	static constexpr int sortCount = 6, baseFilters = 7, collectionCount = 6, filterCount = baseFilters + collectionCount;
 	int sortMode{ 0 };   // 0 name, 1 title id, 2 recently installed, 3 recently played, 4 most played
 	int filterMode{ 0 }; // 0 all, 1 favourites, 2 PS5, 3 PS4, 4 emulators, 5 homebrew, 6 hidden, 7.. collections
-	// Search (R3): an on-screen keyboard; while there is a search, every game that is not
-	// hidden and matches it is shown, whatever the filter. Not saved between runs.
-	bool searchOpen{ false };
-	std::string searchQuery;
-	int searchRow{ 1 }, searchCol{ 0 };
-	float searchAnim{ 0.0f };
-	static constexpr int searchCols = 10, searchMaxLength = 40;
-	static constexpr const char *searchRows[4] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL'", "ZXCVBNM-:&" };
-	struct SearchKey { const char *label; int from, span; };
-	static constexpr SearchKey searchBottom[4] = { { "Space", 0, 3 }, { "Delete", 3, 2 }, { "Clear", 5, 2 }, { "Done", 7, 3 } };
 	static constexpr const char *sortNames[sortCount] = { "Name A-Z", "Title ID", "Recently installed", "Recently played", "Most played", "Largest first" };
 	static constexpr const char *baseFilterNames[baseFilters] = { "All games", "Favourites", "PS5 Games", "PS4 Games", "Emulators", "Homebrew Apps", "Hidden games" };
 	// Collections: six, named in coverflow.ini (collections = ...), a game in any of them
@@ -2150,41 +2140,6 @@ public:
 		return view.empty() ? nullptr : &games[view[std::clamp(selected, 0, (int)view.size() - 1)]];
 	}
 
-	// Search text as it is compared: lower case letters and digits only, so
-	// "spider man" finds "Marvel's Spider-Man 2"
-	static std::string searchKey(const std::string &text)
-	{
-		std::string out;
-		for (unsigned char c : text) {
-			if (std::isalnum(c)) {
-				out += (char)std::tolower(c);
-			}
-		}
-		return out;
-	}
-
-	// Where the search is in the game's name (shown or original) or title id; npos when it isn't
-	static size_t searchMatch(const Game &g, const std::string &query)
-	{
-		size_t best = searchKey(g.title).find(query);
-		for (const std::string *other : { &g.originalTitle, &g.titleId }) {
-			const size_t at = other->empty() ? std::string::npos : searchKey(*other).find(query);
-			if (at != std::string::npos && (best == std::string::npos || at < best)) {
-				best = at;
-			}
-		}
-		return best;
-	}
-
-	// The search changed: show its matches from the first
-	void searchChanged()
-	{
-		rebuildView();
-		selected = 0;
-		position = 0.0f;
-		gridScroll = 0.0f;
-	}
-
 	// Rebuild the view, keeping the selected game where it can
 	void rebuildView()
 	{
@@ -2192,12 +2147,10 @@ public:
 		const int keep = was ? (int)(was - games.data()) : -1;
 		const int keepSlot = selected;
 		view.clear();
-		const std::string query = searchKey(searchQuery);
 		for (int i = 0; i < (int)games.size(); i++) {
 			const Game &g = games[i];
 			const std::string &p = g.section;
-			const bool shown = !query.empty() ? !isHidden(g) && searchMatch(g, query) != std::string::npos
-				: filterMode == 6 ? isHidden(g)
+			const bool shown = filterMode == 6 ? isHidden(g)
 				: !isHidden(g) && (filterMode == 0 || (filterMode == 1 && isFavourite(g)) || (filterMode == 2 && p == "PS5") ||
 					(filterMode == 3 && p == "PS4") || (filterMode == 4 && p == "Emulators") || (filterMode == 5 && p == "Homebrew") ||
 					(filterMode >= baseFilters && inCollection(g, filterMode - baseFilters)));
@@ -2230,10 +2183,6 @@ public:
 			}
 			return lower(x.title) < lower(y.title);
 		});
-		if (!query.empty()) {
-			// Names that start with the search come first
-			std::stable_partition(view.begin(), view.end(), [&](int i) { return searchMatch(games[i], query) == 0; });
-		}
 		// The same game if it is still shown, otherwise the one now in its place
 		selected = view.empty() ? 0 : std::clamp(keepSlot, 0, (int)view.size() - 1);
 		for (int k = 0; k < (int)view.size(); k++) {
@@ -2385,21 +2334,6 @@ public:
 				filterMode = std::clamp(std::atoi(t + test.find("filter=") + 7), 0, filterCount - 1);
 			}
 			menuOpen = test.find("menu") != std::string::npos;
-			if (test.find("search=") != std::string::npos) {
-				// search=TEXT (underscores for spaces), up to the next space
-				const size_t at = test.find("search=") + 7, end = test.find(' ', at);
-				searchQuery = test.substr(at, end == std::string::npos ? std::string::npos : end - at);
-				std::replace(searchQuery.begin(), searchQuery.end(), '_', ' ');
-			}
-			if (test.find("keyboard") != std::string::npos) {
-				searchOpen = true;
-				searchAnim = 1.0f;
-				if (test.find("key=") != std::string::npos) {
-					// key=RC: row R (0-4), column C (0-9)
-					searchRow = std::clamp(test[test.find("key=") + 4] - '0', 0, 4);
-					searchCol = std::clamp(test[test.find("key=") + 5] - '0', 0, searchCols - 1);
-				}
-			}
 			if (test.find("category") != std::string::npos) {
 				categoryOpen = true;
 				categoryIndex = 3;
@@ -4040,119 +3974,6 @@ public:
 		}
 	}
 
-	// The key under the focus on the bottom row (Space, Delete, Clear, Done)
-	int searchBottomKey() const
-	{
-		for (int k = 3; k >= 0; k--) {
-			if (searchCol >= searchBottom[k].from) {
-				return k;
-			}
-		}
-		return 0;
-	}
-
-	void openSearch()
-	{
-		searchOpen = true;
-		menuOpen = false;
-		searchRow = 1;
-		searchCol = 0;
-		playSound(1);
-	}
-
-	void closeSearch()
-	{
-		searchOpen = false;
-		circleHeld = -10.0f;
-		playSound(2);
-		if (!searchQuery.empty()) {
-			showMessage(std::to_string(view.size()) + (view.size() == 1 ? " game" : " games") + " found - CIRCLE clears the search", 3.0f);
-		}
-	}
-
-	// Types the key under the focus
-	void searchPress()
-	{
-		if (searchRow < 4) {
-			if ((int)searchQuery.size() < searchMaxLength) {
-				searchQuery += (char)std::tolower((unsigned char)searchRows[searchRow][searchCol]);
-				searchChanged();
-			}
-			playSound(0);
-			return;
-		}
-		switch (searchBottomKey()) {
-		case 0:
-			if (!searchQuery.empty() && searchQuery.back() != ' ' && (int)searchQuery.size() < searchMaxLength) {
-				searchQuery += ' ';
-			}
-			playSound(0);
-			break;
-		case 1:
-			if (!searchQuery.empty()) {
-				searchQuery.pop_back();
-				searchChanged();
-			}
-			playSound(0);
-			break;
-		case 2:
-			if (!searchQuery.empty()) {
-				searchQuery.clear();
-				searchChanged();
-			}
-			playSound(0);
-			break;
-		default:
-			closeSearch();
-			break;
-		}
-	}
-
-#if defined(VK_EXAMPLE_PS5)
-	void searchInput(const struct pad &p, bool optionsTap)
-	{
-		if (p.pressed & PAD_UP) {
-			searchRow = (searchRow + 4) % 5;
-			playSound(0);
-		}
-		if (p.pressed & PAD_DOWN) {
-			searchRow = (searchRow + 1) % 5;
-			playSound(0);
-		}
-		if (p.pressed & (PAD_LEFT | PAD_RIGHT)) {
-			const int step = (p.pressed & PAD_LEFT) ? -1 : 1;
-			if (searchRow == 4) {
-				searchCol = searchBottom[(searchBottomKey() + 4 + step) % 4].from;
-			} else {
-				searchCol = (searchCol + searchCols + step) % searchCols;
-			}
-			playSound(0);
-		}
-		if (p.pressed & PAD_CROSS) {
-			searchPress();
-		}
-		if ((p.pressed & PAD_SQUARE) && !searchQuery.empty()) {
-			searchQuery.pop_back();
-			searchChanged();
-			playSound(0);
-		}
-		if ((p.pressed & PAD_TRIANGLE) && !searchQuery.empty() && searchQuery.back() != ' ' && (int)searchQuery.size() < searchMaxLength) {
-			searchQuery += ' ';
-			playSound(0);
-		}
-		// L1 / R1 browse the matches without leaving the keyboard
-		if (p.pressed & PAD_L1) {
-			move(-1);
-		}
-		if (p.pressed & PAD_R1) {
-			move(1);
-		}
-		if ((p.pressed & (PAD_CIRCLE | PAD_R3)) || optionsTap) {
-			closeSearch();
-		}
-	}
-#endif
-
 	void handleInput(float dt)
 	{
 		if (closeAfterUpdate > 0.0f) {
@@ -4248,15 +4069,6 @@ public:
 				circleHeld = -10.0f;
 				playSound(2);
 			}
-			return;
-		}
-		if (searchOpen) {
-			searchInput(p, optionsTap);
-			return;
-		}
-		// R3: search
-		if ((p.pressed & PAD_R3) && !menuOpen) {
-			openSearch();
 			return;
 		}
 		if (optionsTap) {
@@ -4358,8 +4170,7 @@ public:
 			}
 		}
 		if (p.pressed & PAD_TOUCH_PAD) {
-			// The next filter, skipping collections nothing is in (a search gives way to it)
-			searchQuery.clear();
+			// The next filter, skipping collections nothing is in
 			do {
 				filterMode = (filterMode + 1) % filterCount;
 			} while (filterMode >= baseFilters && !collectionUsed(filterMode - baseFilters));
@@ -4423,13 +4234,6 @@ public:
 		if ((p.pressed & PAD_CIRCLE) && menuOpen && circleHeld > -5.0f) {
 			menuOpen = false;
 			circleHeld = -10.0f; // this press closed the menu: it does not count towards quitting
-		} else if ((p.pressed & PAD_CIRCLE) && !menuOpen && !searchQuery.empty()) {
-			// CIRCLE clears a search (and does not count towards quitting)
-			searchQuery.clear();
-			rebuildView();
-			circleHeld = -10.0f;
-			showMessage(std::string("Search cleared - showing ") + filterName(filterMode), 2.0f);
-			playSound(2);
 		}
 		circleHeld = (p.held & PAD_CIRCLE) ? circleHeld + dt : 0.0f;
 		if (settings.quitWith == 2 && circleHeld > 2.0f) {
@@ -4597,7 +4401,6 @@ public:
 		ease(menuAnim, menuOpen);
 		ease(wizardAnim, wizard != WZ_NONE);
 		ease(settingsAnim, settingsOpen);
-		ease(searchAnim, searchOpen);
 		ease(dialogAnim, updateDialog);
 		ease(loadingAnim, coversLoaded < (int)games.size());
 		handleInput(dt);
@@ -4685,7 +4488,7 @@ public:
 
 	// ---------------------------------------------------------------- the interface
 
-	enum Glyph { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_OPTIONS, G_SHARE, G_TOUCHPAD, G_L1, G_R1, G_DPAD_LR, G_DPAD_UD, G_L2, G_R2, G_L3, G_R3, G_RSTICK };
+	enum Glyph { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_OPTIONS, G_SHARE, G_TOUCHPAD, G_L1, G_R1, G_DPAD_LR, G_DPAD_UD, G_L2, G_R2, G_L3, G_RSTICK };
 
 	// Everything on screen but the covers, drawn with ImGui's draw list
 	void OnUpdateUIOverlay(vks::UIOverlay *overlay) override
@@ -4802,9 +4605,6 @@ public:
 				dl->AddRectFilled(ImVec2(cx - r * 0.58f, cy - r * 0.22f), ImVec2(cx - r * 0.46f, cy + r * 0.18f), hole);
 				dl->AddCircleFilled(ImVec2(cx + r * 0.52f, cy - r * 0.02f), r * 0.1f, hole);
 				dl->AddCircleFilled(ImVec2(cx + r * 0.72f, cy - r * 0.02f), r * 0.1f, hole);
-			} else if (kind == "search") {
-				dl->AddCircle(ImVec2(cx - r * 0.18f, cy - r * 0.18f), r * 0.62f, c, 24, t * 1.3f);
-				dl->AddLine(ImVec2(cx + r * 0.27f, cy + r * 0.27f), ImVec2(cx + r * 0.85f, cy + r * 0.85f), c, t * 1.8f);
 			} else if (kind == "gear") {
 				for (int i = 0; i < 8; i++) {
 					const float ang = i * 0.7854f;
@@ -4865,9 +4665,8 @@ public:
 			case G_L2:
 			case G_R2:
 			case G_L3:
-			case G_R3:
 			case G_RSTICK: {
-				const char *label = g == G_L1 ? "L1" : g == G_R1 ? "R1" : g == G_L2 ? "L2" : g == G_R2 ? "R2" : g == G_L3 ? "L3" : g == G_R3 ? "R3" : "R";
+				const char *label = g == G_L1 ? "L1" : g == G_R1 ? "R1" : g == G_L2 ? "L2" : g == G_R2 ? "R2" : g == G_L3 ? "L3" : "R";
 				const float size = r * 1.05f, w = width_(label, size) * 0.5f + r * 0.55f;
 				dl->AddRectFilled(ImVec2(cx - w, cy - r * 0.8f), ImVec2(cx + w, cy + r * 0.8f), bg, r * 0.35f);
 				text(label, size, cx, cy - size * 0.52f, fg, 0.5f, false);
@@ -4899,7 +4698,6 @@ public:
 				case G_L2:
 				case G_R2:
 				case G_L3:
-				case G_R3:
 				case G_RSTICK: return width_("L1", r * 1.05f) + 1.1f * r;
 				default: return 2.0f * r;
 				}
@@ -4948,11 +4746,7 @@ public:
 		title(theme.heading, 44.0f * s, margin + 66.0f * s, 44.0f * s, textC);
 		float cx = margin;
 		const float chipY = 108.0f * s, chipSize = 20.0f * s;
-		if (!searchQuery.empty()) {
-			cx += chip("Search: " + fit(searchQuery, chipSize, 420.0f * s), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
-		} else {
-			cx += chip(filterName(filterMode), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
-		}
+		cx += chip(filterName(filterMode), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
 		chip(sortNames[sortMode], cx, chipY, chipSize, IM_COL32(255, 255, 255, 30), textC);
 		// Right: the clock and the position; below, where the library came from and the free space
 		{
@@ -4967,9 +4761,6 @@ public:
 			text(favs, 22.0f * s, ix, 55.0f * s, dimC, 1.0f, false);
 			ix -= width_(favs, 22.0f * s) + 20.0f * s;
 			star(ix, 67.0f * s, 13.0f * s, IM_COL32(255, 200, 70, 255));
-			// The search: lit while there is one (R3)
-			ix -= 42.0f * s;
-			icon("search", ix, 67.0f * s, 15.0f * s, searchQuery.empty() && !searchOpen ? withAlpha(textC, 0.9f) : accentC);
 			if (!view.empty()) {
 				const std::string count = std::to_string(selected + 1) + " / " + std::to_string(view.size());
 				text(count, 24.0f * s, ix - 36.0f * s, 54.0f * s, dimC, 1.0f, false);
@@ -4997,7 +4788,7 @@ public:
 		// ---- the selected game's name, category and favourite mark
 		if (!view.empty()) {
 			const Game &game = *current();
-			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f) * (1.0f - searchAnim);
+			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f);
 			const float titleSize = 54.0f * s, ty = H * 0.775f;
 			title(fit(game.title, titleSize, W * 0.8f), titleSize, W * 0.5f, ty, withAlpha(textC, fade), 0.5f);
 			std::string meta = game.subtitle.empty() ? categoryName(game.section) : game.subtitle;
@@ -5038,11 +4829,6 @@ public:
 					mx += 34.0f * s;
 				}
 				text(meta, metaSize, mx, my, withAlpha(dimC, fade));
-			}
-		} else if (!searchQuery.empty()) {
-			text("No games match '" + fit(searchQuery, 34.0f * s, W * 0.5f) + "'", 34.0f * s, W * 0.5f, H * 0.36f, textC, 0.5f);
-			if (!searchOpen) {
-				text("R3 changes the search, CIRCLE clears it", 24.0f * s, W * 0.5f, H * 0.36f + 54.0f * s, dimC, 0.5f);
 			}
 		} else {
 			text(std::string("No ") + filterName(filterMode), 34.0f * s, W * 0.5f, H * 0.42f, textC, 0.5f);
@@ -5536,64 +5322,6 @@ public:
 			}
 		}
 
-		// ---- the search keyboard, along the bottom so the matching covers stay in sight
-		if (searchAnim > 0.01f) {
-			const float a = searchAnim, pad = 34.0f * s, gap = 10.0f * s, keyH = 62.0f * s, fieldH = 76.0f * s;
-			const float w = 1060.0f * s, keyW = (w - pad * 2.0f - gap * (searchCols - 1)) / searchCols;
-			const float h = pad + fieldH + 22.0f * s + 5.0f * keyH + 4.0f * gap + 64.0f * s;
-			const float x0 = (W - w) * 0.5f, y0 = H - h - 36.0f * s + (1.0f - a) * 40.0f * s;
-			panel(x0, y0, w, h, a);
-			// The field: what is typed, a caret, and how many games match
-			const float fx = x0 + pad, fy = y0 + pad, fw = w - pad * 2.0f;
-			dl->AddRectFilled(ImVec2(fx, fy), ImVec2(fx + fw, fy + fieldH), IM_COL32(4, 8, 18, (int)(230 * a)), 18.0f * s);
-			dl->AddRect(ImVec2(fx, fy), ImVec2(fx + fw, fy + fieldH), withAlpha(accentC, a * 0.9f), 18.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-			icon("search", fx + 44.0f * s, fy + fieldH * 0.5f, 17.0f * s, withAlpha(accentC, a));
-			const float qs = 32.0f * s, qx = fx + 80.0f * s, qy = fy + (fieldH - qs) * 0.45f;
-			const std::string count = std::to_string(view.size()) + (view.size() == 1 ? " game" : " games");
-			const float countW = width_(count, 22.0f * s);
-			if (searchQuery.empty()) {
-				text("Search your games", qs, qx, qy, withAlpha(dimC, a * 0.8f), 0.0f, false);
-			} else {
-				const std::string shown = fit(searchQuery, qs, fw - 140.0f * s - countW);
-				title(shown, qs, qx, qy, withAlpha(textC, a));
-				if (std::fmod(clock, 1.0f) < 0.6f) {
-					const float caretX = qx + width_(shown, qs) * 1.04f + 4.0f * s;
-					dl->AddRectFilled(ImVec2(caretX, fy + 18.0f * s), ImVec2(caretX + 3.0f * s, fy + fieldH - 18.0f * s), withAlpha(accentC, a));
-				}
-			}
-			text(count, 22.0f * s, fx + fw - 34.0f * s, fy + (fieldH - 22.0f * s) * 0.48f, withAlpha(searchQuery.empty() ? dimC : textC, a), 1.0f, false);
-			// The keys
-			float ky = fy + fieldH + 22.0f * s;
-			auto key = [&](const std::string &label, float x, float kw, bool focus, bool wide) {
-				const float r = 12.0f * s;
-				dl->AddRectFilled(ImVec2(x, ky), ImVec2(x + kw, ky + keyH), focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)((wide ? 22 : 14) * a)), r);
-				if (focus) {
-					dl->AddRect(ImVec2(x - 3.0f * s, ky - 3.0f * s), ImVec2(x + kw + 3.0f * s, ky + keyH + 3.0f * s), IM_COL32(170, 205, 255, (int)(230 * a)), r + 3.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-				} else {
-					dl->AddRect(ImVec2(x, ky), ImVec2(x + kw, ky + keyH), IM_COL32(255, 255, 255, (int)(26 * a)), r, ImDrawCornerFlags_All, 1.0f * s);
-				}
-				const float ls = wide ? 24.0f * s : 30.0f * s;
-				if (wide) {
-					text(label, ls, x + kw * 0.5f, ky + (keyH - ls) * 0.46f, withAlpha(focus ? white : textC, a), 0.5f, false);
-				} else {
-					title(label, ls, x + kw * 0.5f, ky + (keyH - ls) * 0.42f, withAlpha(focus ? white : textC, a), 0.5f);
-				}
-			};
-			for (int row = 0; row < 4; row++) {
-				for (int col = 0; col < searchCols; col++) {
-					key(std::string(1, searchRows[row][col]), fx + col * (keyW + gap), keyW, searchRow == row && searchCol == col, false);
-				}
-				ky += keyH + gap;
-			}
-			const int bottomFocus = searchRow == 4 ? searchBottomKey() : -1;
-			for (int k = 0; k < 4; k++) {
-				const SearchKey &b = searchBottom[k];
-				key(b.label, fx + b.from * (keyW + gap), b.span * keyW + (b.span - 1) * gap, bottomFocus == k, true);
-			}
-			hints({ { { G_CROSS }, "Type" }, { { G_SQUARE }, "Delete" }, { { G_TRIANGLE }, "Space" }, { { G_L1, G_R1 }, "Browse matches" }, { { G_CIRCLE }, "Done" } },
-				W * 0.5f, y0 + h - 34.0f * s, a);
-		}
-
 		// ---- the toast: messages slide in above the hints
 		if (messageTimer > 0.0f && !message.empty()) {
 			const float a = std::clamp(messageTimer * 3.0f, 0.0f, 1.0f) * std::clamp((introTime > 0.0f ? 1.0f : 0.0f), 0.0f, 1.0f);
@@ -5607,14 +5335,11 @@ public:
 		}
 
 		// ---- the hints along the bottom
-		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && wizardAnim < 0.5f && searchAnim < 0.5f && !launcherPanel) {
+		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && wizardAnim < 0.5f && !launcherPanel) {
 			std::vector<std::pair<std::vector<Glyph>, std::string>> items = {
 				{ { G_DPAD_LR }, "Browse" }, { { G_L2, G_R2 }, "Letter" }, { { G_CROSS }, "Start" }, { { G_TRIANGLE }, "Menu" },
-				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_R3 }, "Search" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
+				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
 			};
-			if (!searchQuery.empty()) {
-				items.insert(items.begin() + 6, { { G_CIRCLE }, "Clear search" });
-			}
 			if (settings.quitWith == 0) {
 				items.push_back({ { G_OPTIONS, G_SHARE }, "Quit" });
 			} else if (settings.quitWith == 1) {

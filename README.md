@@ -11,7 +11,6 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 - Play time per game, with Recently played, Most played and Largest first sorts
 - Your own names and covers, shown only in Cover Flow (the console's own data is never changed)
 - Favourites, hide, categories (PS5 / PS4 / Emulators / Homebrew) and six collections
-- Search with an on-screen keyboard (R3): covers filter as you type
 - Sort and filter, letter jump (L2/R2), fast scroll with the right stick
 - Details panel with size, install date, play time and storage location
 - Themes: six built in, your own picture/colours/font/music, and interface sounds
@@ -32,7 +31,6 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 | Triangle | Menu (details, favourite, hide, category, collections) |
 | Square | Sort |
 | Touchpad | Filter |
-| R3 | Search (Circle clears it) |
 | L3 | Cover Flow / grid |
 | Options | Settings |
 | Options + Share (held) | Quit (changeable in Settings) |
@@ -79,9 +77,6 @@ font.
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
-- **v22** - Search: R3 opens an on-screen keyboard and the covers filter as you type
-  (names, original names and title ids; spaces and punctuation ignored, so
-  "spiderman" finds "Spider-Man"). Circle clears the search.
 - **v21** - The blue look matched to the design: bold headings, star and gear in the
   header, last played and play time in a pill, a bar behind the button guide, clearer
   backup and restore screens with time remaining.
