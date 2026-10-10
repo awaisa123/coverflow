@@ -223,6 +223,7 @@ public:
 	struct Pending;
 	struct DumperProgress;
 	bool dumpOpen{ false }; // Real game/app dumping workflow
+	bool manageDumpsOpen{ false }; // Backup destination/history screen
 	std::shared_ptr<DumperProgress> dumpJob;
 	std::string dumpResult;
 	bool dumpSucceeded{ false };
@@ -3247,7 +3248,7 @@ public:
 			"Category:  " + categoryName(g.section) + (sectionOverride.count(g.titleId) ? "" : "  (automatic)"),
 			"Collections:  " + collectionSummary(g),
 			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow",
-			"Dump Game / App", "Close" };
+			"Dump Game / App", "Manage Dumps", "Close" };
 	}
 
 	std::string collectionSummary(const Game &g) const
@@ -3340,13 +3341,19 @@ public:
 			break;
 		case 5:
 			dumpOpen = true;
+			manageDumpsOpen = false;
 			dumpIndex = 0;
 			dumpDestination = 0;
 			dumpStage = 0;
 			dumpProgress = 0.0f;
 			break;
+		case 6:
+			manageDumpsOpen = true;
+			dumpOpen = false;
+			break;
 		default:
 			menuOpen = false;
+			manageDumpsOpen = false;
 			break;
 		}
 	}
@@ -3649,12 +3656,18 @@ public:
 			categoryOpen = false;
 			collectionsOpen = false;
 			dumpOpen = false;
+			manageDumpsOpen = false;
 			playSound(menuOpen ? 1 : 2);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
 		}
-		if (menuOpen && dumpOpen) {
+		if (menuOpen && manageDumpsOpen) {
+			if (p.pressed & PAD_CIRCLE) {
+				manageDumpsOpen = false;
+				circleHeld = -10.0f;
+			}
+		} else if (menuOpen && dumpOpen) {
 			// The external PS5 App Dumper reports real byte progress off the render thread.
 			if (dumpStage == 2 && dumpJob) {
 				bool done = false, success = false, queued = false;
@@ -4571,6 +4584,33 @@ public:
 			const char *navigationHint = dumpStage == 2 ? "Waiting for dumper" : "D-pad: navigate";
 			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
 				x0 + w * 0.5f, y0 + h - 20.0f * s, a);
+		}
+
+
+		// ---- Manage Dumps: real empty state until a backup-history source is available
+		if (menuAnim > 0.01f && menuOpen && manageDumpsOpen) {
+			const float a = menuAnim, w = 1120.0f * s, h = 650.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
+			panel(x0, y0, w, h, a);
+			const float pad = 30.0f * s;
+			text("MANAGE DUMPS", 29.0f * s, x0 + pad, y0 + 25.0f * s, withAlpha(textC, a));
+			text("BACKUP LIBRARY", 13.0f * s, x0 + w - pad, y0 + 34.0f * s, withAlpha(accentC, a), 1.0f, false);
+			const float bodyY = y0 + 88.0f * s, bodyH = h - 145.0f * s;
+			dl->AddRectFilled(ImVec2(x0 + pad, bodyY), ImVec2(x0 + w - pad, bodyY + bodyH),
+				IM_COL32(13, 22, 36, (int)(242 * a)), 12.0f * s);
+			dl->AddRect(ImVec2(x0 + pad, bodyY), ImVec2(x0 + w - pad, bodyY + bodyH),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 12.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float cx = W * 0.5f, cy = bodyY + bodyH * 0.38f;
+			dl->AddRect(ImVec2(cx - 24.0f * s, cy - 17.0f * s), ImVec2(cx + 24.0f * s, cy + 17.0f * s),
+				withAlpha(accentC, a), 5.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+			dl->AddLine(ImVec2(cx - 12.0f * s, cy - 5.0f * s), ImVec2(cx + 12.0f * s, cy - 5.0f * s), withAlpha(accentC, a), 2.0f * s);
+			dl->AddLine(ImVec2(cx - 12.0f * s, cy + 4.0f * s), ImVec2(cx + 12.0f * s, cy + 4.0f * s), withAlpha(accentC, a), 2.0f * s);
+			text("No backup history available", 23.0f * s, cx, cy + 43.0f * s, withAlpha(textC, a), 0.5f, false);
+			text("Completed dumps will appear here when backup-history scanning is connected.",
+				15.0f * s, cx, cy + 77.0f * s, withAlpha(dimC, a), 0.5f, false);
+			text("No sample games or backup entries are shown as real data.", 13.0f * s, cx,
+				cy + 105.0f * s, withAlpha(dimC, a), 0.5f, false);
+			hints({ { { G_CIRCLE }, "Back" } }, W * 0.5f, y0 + h - 25.0f * s, a);
 		}
 
 		// ---- settings
