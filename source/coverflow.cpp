@@ -72,9 +72,99 @@
  */
 
 #include "vulkanexamplebase.h"
+#include "coverflow_files.h" // embeddedFiles: the shaders and the icon (made by make_files.py)
 
-static constexpr const char *coverFlowVersion = "v10";
-static constexpr int launcherVersion = 5; // the launcher in the title folder
+#if defined(VK_EXAMPLE_PS5) && !defined(PS5_HOST_REFERENCE)
+// The console's network, TLS and HTTP/2 libraries, for downloading updates from
+// inside Cover Flow (an app can use the console's certificates; a payload could
+// not). Named through asm labels so the declarations do not depend on the
+// namespace they sit in.
+extern "C" int cf_sceNetInit(void) __asm__("sceNetInit");
+extern "C" int cf_sceNetPoolCreate(const char *, int, int) __asm__("sceNetPoolCreate");
+extern "C" int cf_sceSslInit(size_t) __asm__("sceSslInit");
+extern "C" int cf_sceHttp2Init(int, int, size_t, int) __asm__("sceHttp2Init");
+extern "C" int cf_sceHttp2CreateTemplate(int, const char *, int, int) __asm__("sceHttp2CreateTemplate");
+extern "C" int cf_sceHttp2CreateRequestWithURL(int, const char *, const char *, uint64_t) __asm__("sceHttp2CreateRequestWithURL");
+extern "C" int cf_sceHttp2DeleteRequest(int) __asm__("sceHttp2DeleteRequest");
+extern "C" int cf_sceHttp2SendRequest(int, const void *, size_t) __asm__("sceHttp2SendRequest");
+extern "C" int cf_sceHttp2GetStatusCode(int, int *) __asm__("sceHttp2GetStatusCode");
+extern "C" int cf_sceHttp2ReadData(int, void *, size_t) __asm__("sceHttp2ReadData");
+// The console's time zone and clock format, for the clock in the header
+extern "C" int cf_sceSystemServiceParamGetInt(int, int *) __asm__("sceSystemServiceParamGetInt");
+#endif
+
+// SHA-256, for checking every downloaded file against the release's SHA256SUMS
+struct Sha256 {
+	uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
+	uint64_t length = 0;
+	unsigned char block[64];
+	size_t used = 0;
+	static uint32_t ror(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+	void compress(const unsigned char *p)
+	{
+		static const uint32_t k[64] = {
+			0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01,
+			0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+			0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+			0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+			0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08,
+			0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+			0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2 };
+		uint32_t w[64];
+		for (int i = 0; i < 16; i++) {
+			w[i] = (uint32_t)p[i * 4] << 24 | (uint32_t)p[i * 4 + 1] << 16 | (uint32_t)p[i * 4 + 2] << 8 | p[i * 4 + 3];
+		}
+		for (int i = 16; i < 64; i++) {
+			w[i] = w[i - 16] + (ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3)) + w[i - 7] +
+				(ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10));
+		}
+		uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+		for (int i = 0; i < 64; i++) {
+			const uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+			const uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+			hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+		}
+		h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+	}
+	void update(const void *data, size_t size)
+	{
+		const unsigned char *p = (const unsigned char *)data;
+		length += size;
+		while (size > 0) {
+			const size_t take = std::min(size, 64 - used);
+			std::memcpy(block + used, p, take);
+			used += take;
+			p += take;
+			size -= take;
+			if (used == 64) {
+				compress(block);
+				used = 0;
+			}
+		}
+	}
+	std::string hex()
+	{
+		const uint64_t bits = length * 8;
+		const unsigned char pad = 0x80, zero = 0;
+		update(&pad, 1);
+		while (used != 56) {
+			update(&zero, 1);
+		}
+		unsigned char len[8];
+		for (int i = 0; i < 8; i++) {
+			len[i] = (unsigned char)(bits >> (56 - i * 8));
+		}
+		update(len, 8);
+		char out[65];
+		for (int i = 0; i < 8; i++) {
+			std::snprintf(out + i * 8, 9, "%08x", h[i]);
+		}
+		return std::string(out, 64);
+	}
+};
+
+static constexpr const char *coverFlowVersion = "v14";
+static constexpr int launcherVersion = 8; // the launcher in the title folder
 
 class VulkanExample : public VulkanExampleBase
 {
@@ -94,7 +184,24 @@ public:
 		long long installed{ 0 };
 		vks::Texture2D texture;
 		VkDescriptorSet descriptorSet{ VK_NULL_HANDLE };
+		bool loaded{ false };   // its cover is on the GPU; until then the placeholder card shows
+		// Where its cover comes from, tried in this order by the cover loader
+		std::string customPath, cachePath, fetchId;
+		int demoIndex{ 0 };
 	};
+	vks::Texture2D placeholderTexture;
+	VkDescriptorSet placeholderSet{ VK_NULL_HANDLE };
+
+	// Covers decoded in the background, uploaded a few a frame
+	struct CoverResults {
+		std::mutex mutex;
+		std::vector<std::pair<int, std::pair<std::vector<uint8_t>, std::string>>> ready; // game, (rgba, where from)
+		int done{ 0 };
+		int fetched{ 0 };
+	};
+	std::shared_ptr<CoverResults> coverResults = std::make_shared<CoverResults>();
+	int coversLoaded{ 0 };
+	float loadingFade{ 1.0f };
 	std::vector<Game> games;
 	std::vector<int> view;       // the games shown, in order: indices into games
 	std::string listSource;
@@ -112,6 +219,14 @@ public:
 	bool menuOpen{ false };
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
+	bool collectionsOpen{ false }; // the collections checklist inside the game menu
+	int collectionIndex{ 0 };
+	static constexpr int gridCols = 7;
+	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
+	float stickTimer{ 0.0f }, stickYTimer{ 0.0f };
+	bool l2Down{ false }, r2Down{ false };
+	std::string letterShown;      // the letter a jump landed on, shown large for a moment
+	float letterTimer{ 0.0f };
 	int categoryIndex{ 0 };
 	static constexpr const char *categoryKeys[5] = { "", "PS5", "PS4", "Emulators", "Homebrew" }; // "" = automatic
 
@@ -125,6 +240,11 @@ public:
 		bool updateCheck{ true };
 		std::string updateRepo;
 		int quitWith{ 0 }; // 0 OPTIONS + SHARE, 1 L1 + R1 + OPTIONS, 2 hold CIRCLE, 3 settings menu only
+		std::string lastGame; // the game selected when Cover Flow last closed
+		bool artBackgrounds{ true };
+		bool sounds{ true };
+		bool grid{ false };
+		std::string themeName; // a built-in theme, a folder in themes/, or "" for theme/ (the custom one) or Default
 	} settings;
 	static constexpr const char *quitNames[4] = { "hold OPTIONS + SHARE", "hold L1 + R1 + OPTIONS", "hold CIRCLE (2 seconds)",
 		"Settings menu only" };
@@ -145,16 +265,44 @@ public:
 	std::shared_ptr<Pending> updateCheckJob, updateApplyJob;
 	bool updateDialog{ false };
 	int updateChoice{ 0 };
-	std::string updateTag;
+	std::string updateTag, updateNotes;
 	bool updating{ false };
+	float closeAfterUpdate{ 0.0f }; // seconds until Cover Flow closes after an update
 	float updateCheckDelay{ 3.0f };
 
 	// Sorting and filtering, kept between runs with the favourites and hidden games
-	static constexpr int sortCount = 3, filterCount = 7;
-	int sortMode{ 0 };   // 0 name, 1 title id, 2 recently installed
-	int filterMode{ 0 }; // 0 all, 1 favourites, 2 PS5, 3 PS4, 4 emulators, 5 homebrew, 6 hidden
-	static constexpr const char *sortNames[sortCount] = { "Name A-Z", "Title ID", "Recently installed" };
-	static constexpr const char *filterNames[filterCount] = { "All games", "Favourites", "PS5 Games", "PS4 Games", "Emulators", "Homebrew Apps", "Hidden games" };
+	static constexpr int sortCount = 5, baseFilters = 7, collectionCount = 6, filterCount = baseFilters + collectionCount;
+	int sortMode{ 0 };   // 0 name, 1 title id, 2 recently installed, 3 recently played, 4 most played
+	int filterMode{ 0 }; // 0 all, 1 favourites, 2 PS5, 3 PS4, 4 emulators, 5 homebrew, 6 hidden, 7.. collections
+	static constexpr const char *sortNames[sortCount] = { "Name A-Z", "Title ID", "Recently installed", "Recently played", "Most played" };
+	static constexpr const char *baseFilterNames[baseFilters] = { "All games", "Favourites", "PS5 Games", "PS4 Games", "Emulators", "Homebrew Apps", "Hidden games" };
+	// Collections: six, named in coverflow.ini (collections = ...), a game in any of them
+	std::vector<std::string> collectionNames{ "Racing", "Co-op", "Playing now", "Finished", "Retro", "Family" };
+	std::map<std::string, int> collectionMembers; // title id -> bit per collection
+	std::string filterName(int f) const
+	{
+		return f < baseFilters ? baseFilterNames[f] : collectionNames[f - baseFilters];
+	}
+	bool collectionUsed(int c) const
+	{
+		for (const auto &[id, bits] : collectionMembers) {
+			if (bits >> c & 1) {
+				return true;
+			}
+		}
+		return false;
+	}
+	bool inCollection(const Game &g, int c) const
+	{
+		auto it = collectionMembers.find(g.titleId);
+		return it != collectionMembers.end() && (it->second >> c & 1);
+	}
+	// Play time the launcher recorded for games started from Cover Flow
+	struct PlayRecord {
+		long long seconds{ 0 }, last{ 0 }, count{ 0 };
+	};
+	std::map<std::string, PlayRecord> playTime;
+	std::string storageText;
 	std::set<std::string> favourites, hidden;
 	std::map<std::string, std::string> sectionOverride; // title id -> PS5, PS4, Emulators, Homebrew
 
@@ -209,9 +357,12 @@ public:
 	struct PushConstants {
 		glm::mat4 mvp;
 		glm::vec4 params;
+		glm::vec4 extra; // accent colour, time
 	};
+	float clock{ 0.0f };
 
 	struct {
+		VkPipeline art{ VK_NULL_HANDLE };
 		VkPipeline background{ VK_NULL_HANDLE };
 		VkPipeline reflection{ VK_NULL_HANDLE };
 		VkPipeline cover{ VK_NULL_HANDLE };
@@ -240,15 +391,26 @@ public:
 		if (musicPlaying) {
 			audio_stop();
 		}
+		rememberSelection();
 		if (device) {
 			vkDestroyPipeline(device, pipelines.background, nullptr);
+			vkDestroyPipeline(device, pipelines.art, nullptr);
+			for (auto &a : arts) {
+				a->texture.destroy();
+			}
+			if (artPool) {
+				vkDestroyDescriptorPool(device, artPool, nullptr);
+			}
 			vkDestroyPipeline(device, pipelines.reflection, nullptr);
 			vkDestroyPipeline(device, pipelines.cover, nullptr);
 			vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
 			vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
 			for (auto &game : games) {
-				game.texture.destroy();
+				if (game.loaded) {
+					game.texture.destroy();
+				}
 			}
+			placeholderTexture.destroy();
 			if (theme.hasPicture) {
 				backgroundTexture.destroy();
 			}
@@ -593,9 +755,116 @@ public:
 
 	// ---------------------------------------------------------------- the theme
 
-	void loadTheme()
+	// The built-in themes: colours only
+	struct Preset {
+		const char *name;
+		int accent[3], text[3], dim[3];
+	};
+	static constexpr Preset presets[] = {
+		{ "Default", { 77, 115, 242 }, { 235, 238, 245 }, { 150, 158, 175 } },
+		{ "Midnight", { 110, 90, 255 }, { 232, 230, 250 }, { 150, 145, 185 } },
+		{ "Racing Red", { 230, 50, 60 }, { 245, 238, 236 }, { 185, 160, 160 } },
+		{ "Emerald", { 40, 200, 140 }, { 232, 245, 240 }, { 145, 175, 165 } },
+		{ "Sunset", { 250, 140, 60 }, { 250, 240, 230 }, { 190, 165, 145 } },
+		{ "Mono", { 200, 200, 210 }, { 240, 240, 242 }, { 150, 150, 158 } },
+	};
+
+	// Every theme to choose from: the built-in ones, theme/ (as "Custom") and each folder in themes/
+	std::vector<std::string> themeNames() const
 	{
-		const std::string folder = appRoot() + "theme/";
+		std::vector<std::string> names;
+		for (const Preset &p : presets) {
+			names.push_back(p.name);
+		}
+		if (std::ifstream(appRoot() + "theme/theme.ini").good()) {
+			names.push_back("Custom");
+		}
+		if (DIR *dir = opendir((appRoot() + "themes").c_str())) {
+			std::vector<std::string> folders;
+			while (dirent *e = readdir(dir)) {
+				const std::string n = e->d_name;
+				if (n[0] != '.' && std::ifstream(appRoot() + "themes/" + n + "/theme.ini").good()) {
+					folders.push_back(n);
+				}
+			}
+			closedir(dir);
+			std::sort(folders.begin(), folders.end());
+			names.insert(names.end(), folders.begin(), folders.end());
+		}
+		return names;
+	}
+
+	// The theme in use: as chosen, or "Custom" when theme/ exists and nothing was chosen (older versions)
+	std::string currentTheme() const
+	{
+		if (!settings.themeName.empty()) {
+			return settings.themeName;
+		}
+		return settings.themeOn && std::ifstream(appRoot() + "theme/theme.ini").good() ? "Custom" : "Default";
+	}
+
+	static std::string themeFolder(const std::string &name)
+	{
+		if (name == "Custom") {
+			return appRoot() + "theme/";
+		}
+		for (const Preset &p : presets) {
+			if (name == p.name) {
+				return "";
+			}
+		}
+		return appRoot() + "themes/" + name + "/";
+	}
+
+	// Switch theme: colours at once, a picture and music too when the theme has them
+	void applyTheme(const std::string &name, bool live)
+	{
+		if (live) {
+			stopAudio();
+			if (theme.hasPicture) {
+				vkDeviceWaitIdle(device);
+				if (backgroundSet) {
+					vkFreeDescriptorSets(device, artPool, 1, &backgroundSet);
+					backgroundSet = VK_NULL_HANDLE;
+				}
+				backgroundTexture.destroy();
+			}
+		}
+		theme = Theme{};
+		musicFrames.clear();
+		musicCursor.store(0);
+		for (const Preset &p : presets) {
+			if (name == p.name) {
+				theme.accent = glm::vec3(p.accent[0], p.accent[1], p.accent[2]) / 255.0f;
+				theme.text = IM_COL32(p.text[0], p.text[1], p.text[2], 255);
+				theme.dim = IM_COL32(p.dim[0], p.dim[1], p.dim[2], 255);
+			}
+		}
+		const std::string folder = themeFolder(name);
+		if (!folder.empty()) {
+			loadTheme(folder);
+		}
+		if (live && theme.hasPicture && artPool) {
+			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(artPool, &descriptorSetLayout, 1);
+			if (vkAllocateDescriptorSets(device, &allocInfo, &backgroundSet) == VK_SUCCESS) {
+				VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(backgroundSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &backgroundTexture.descriptor);
+				vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+			} else {
+				backgroundTexture.destroy();
+				theme.hasPicture = false;
+			}
+		}
+		applySettings();
+		if (live) {
+			startAudio();
+#if defined(VK_EXAMPLE_PS5)
+			pad_light_bar((uint8_t)(theme.accent.r * 255), (uint8_t)(theme.accent.g * 255), (uint8_t)(theme.accent.b * 255));
+#endif
+		}
+	}
+
+	void loadTheme(const std::string &folder)
+	{
 		auto ini = readIni(folder + "theme.ini");
 		auto num = [&](const char *key, float def, float lo, float hi) {
 			auto it = ini.find(key);
@@ -632,8 +901,9 @@ public:
 				stbi_image_free(pixels);
 			}
 		}
-		if (ini.count("music") && !ini["music"].empty()) {
-			startMusic(folder + ini["music"]);
+		if (ini.count("music") && !ini["music"].empty() && !loadWav(folder + ini["music"])) {
+			musicFrames.clear();
+			std::cerr << "Cover Flow: theme music " << ini["music"] << " is not a PCM WAV file it can play\n";
 		}
 		if (!ini.empty()) {
 			std::cerr << "Cover Flow: theme from " << folder << "theme.ini\n";
@@ -708,33 +978,103 @@ public:
 		return true;
 	}
 
+	// ---- sound: the theme's music and short interface sounds, mixed on the audio thread
+
+	std::vector<int16_t> sfx[4]; // move, open / select, back, error: mono 48 kHz
+	std::atomic<int> sfxPending[4]{};
+	struct Voice {
+		int sound{ -1 };
+		size_t at{ 0 };
+	} voices[4];
+
+	// Short sounds, made here: a soft tick, a rising and a falling pair of notes, a low buzz
+	void makeSounds()
+	{
+		auto tone = [](std::vector<int16_t> &out, float f0, float f1, float ms, float volume) {
+			const int n = (int)(48.0f * ms);
+			const size_t start = out.size();
+			out.resize(start + n);
+			float phase = 0.0f;
+			for (int i = 0; i < n; i++) {
+				const float t = (float)i / n;
+				phase += 6.2831853f * (f0 + (f1 - f0) * t) / 48000.0f;
+				const float env = std::min(1.0f, i / 96.0f) * std::exp(-t * 5.0f);
+				out[start + i] = (int16_t)(std::sin(phase) * env * volume * 32767.0f);
+			}
+		};
+		tone(sfx[0], 1900.0f, 1700.0f, 28.0f, 0.10f);
+		tone(sfx[1], 660.0f, 660.0f, 60.0f, 0.13f);
+		tone(sfx[1], 990.0f, 990.0f, 90.0f, 0.13f);
+		tone(sfx[2], 880.0f, 880.0f, 60.0f, 0.12f);
+		tone(sfx[2], 590.0f, 590.0f, 90.0f, 0.12f);
+		tone(sfx[3], 180.0f, 150.0f, 160.0f, 0.16f);
+	}
+
+	void playSound(int type)
+	{
+		if (settings.sounds && musicPlaying && type >= 0 && type < 4) {
+			sfxPending[type]++;
+		}
+	}
+
 	static void fillMusic(int16_t *frames, int count, void *user)
 	{
 		auto *self = (VulkanExample *)user;
 		const size_t total = self->musicFrames.size() / 2;
 		size_t at = self->musicCursor.load();
 		const float volume = self->musicVolume.load();
+		for (int t = 0; t < 4; t++) {
+			while (self->sfxPending[t].load() > 0) {
+				self->sfxPending[t]--;
+				for (Voice &v : self->voices) {
+					if (v.sound < 0) {
+						v.sound = t;
+						v.at = 0;
+						break;
+					}
+				}
+			}
+		}
 		for (int i = 0; i < count; i++) {
-			frames[i * 2] = (int16_t)(self->musicFrames[at * 2] * volume);
-			frames[i * 2 + 1] = (int16_t)(self->musicFrames[at * 2 + 1] * volume);
-			at = at + 1 < total ? at + 1 : 0;
+			int l = 0, r = 0;
+			if (total) {
+				l = (int)(self->musicFrames[at * 2] * volume);
+				r = (int)(self->musicFrames[at * 2 + 1] * volume);
+				at = at + 1 < total ? at + 1 : 0;
+			}
+			for (Voice &v : self->voices) {
+				if (v.sound >= 0) {
+					const int x = self->sfx[v.sound][v.at++];
+					l += x;
+					r += x;
+					if (v.at >= self->sfx[v.sound].size()) {
+						v.sound = -1;
+					}
+				}
+			}
+			frames[i * 2] = (int16_t)std::clamp(l, -32768, 32767);
+			frames[i * 2 + 1] = (int16_t)std::clamp(r, -32768, 32767);
 		}
 		self->musicCursor.store(at);
 	}
 
-	void startMusic(const std::string &path)
+	// The audio output runs while there is music or the sounds are on (never in test runs)
+	void startAudio()
 	{
-		if (!loadWav(path)) {
-			std::cerr << "Cover Flow: theme music " << path << " is not a PCM WAV file it can play\n";
-			return;
-		}
 #if defined(VK_EXAMPLE_PS5)
-		if (ps5.frameBudget) {
-			return; // test runs stay silent
+		if (ps5.frameBudget || musicPlaying || (musicFrames.empty() && !settings.sounds)) {
+			return;
 		}
 		musicPlaying = audio_start(fillMusic, this);
 #endif
-		std::cerr << "Cover Flow: music " << path << (musicPlaying ? " playing" : " loaded (no audio output)") << "\n";
+	}
+
+	void stopAudio()
+	{
+		if (musicPlaying) {
+			audio_stop();
+			musicPlaying = false;
+		}
 	}
 
 	// ---------------------------------------------------------------- the launcher
@@ -980,19 +1320,20 @@ public:
 		return it != sectionOverride.end() ? it->second : autoSection(g.titleId, g.title, g.contentId);
 	}
 
-	void addGame(const std::string &title, const std::string &subtitle, const std::vector<uint8_t> &rgba, const std::string &titleId,
-		const std::string &coverFrom, long long bytes = 0, long long installedAt = 0)
+	Game &addGame(const std::string &title, const std::string &subtitle, const std::string &titleId, long long bytes = 0,
+		long long installedAt = 0)
 	{
 		Game game;
 		game.title = title;
 		game.subtitle = subtitle;
 		game.titleId = titleId;
 		game.platform = platformOf(titleId);
-		game.coverFrom = coverFrom;
+		game.coverFrom = "loading";
 		game.bytes = bytes;
 		game.installed = installedAt;
-		game.texture.fromBuffer((void *)rgba.data(), rgba.size(), VK_FORMAT_R8G8B8A8_SRGB, coverSize, coverSize, vulkanDevice, queue);
+		game.demoIndex = (int)games.size();
 		games.push_back(std::move(game));
+		return games.back();
 	}
 
 	struct Custom {
@@ -1025,20 +1366,19 @@ public:
 		return list;
 	}
 
-	// The installed list (live or cached) with games.txt's overrides and extras
+	// The installed list (live or cached) with games.txt's overrides and extras;
+	// covers are only planned here and loaded in the background
 	void buildFromList(const std::vector<Entry> &list, bool live)
 	{
 		const std::string covers = appRoot() + "covers/";
 		const std::string cache = covers + "auto/";
 		std::vector<Custom> custom = readGamesTxt();
 		std::set<std::string> used;
-		int fetched = 0;
 		for (const Entry &e : list) {
 			if (e.id == ownTitleId) {
 				continue;
 			}
-			std::string name = cleanName(e.name), subtitle, from;
-			std::vector<uint8_t> cover;
+			std::string name = cleanName(e.name), subtitle, customPath;
 			for (const Custom &c : custom) {
 				if (c.id == e.id) {
 					if (!c.name.empty()) {
@@ -1047,60 +1387,25 @@ public:
 					if (!c.subtitle.empty()) {
 						subtitle = c.subtitle;
 					}
-					if (!c.image.empty() && cover.empty()) {
-						cover = loadCover(covers + c.image);
-						if (!cover.empty()) {
-							from = "custom (games.txt)";
-						}
+					if (!c.image.empty() && customPath.empty()) {
+						customPath = covers + c.image;
 					}
 				}
-			}
-			if (cover.empty()) {
-				cover = loadCover(cache + e.id + ".png");
-				if (!cover.empty()) {
-					from = "game icon";
-				}
-			}
-			if (cover.empty() && live) {
-				const std::string answer = askLauncher("icon " + e.id);
-				const size_t nl = answer.find('\n');
-				if (answer.rfind("ok ", 0) == 0 && nl != std::string::npos) {
-					const std::string png = answer.substr(nl + 1);
-					int w = 0, h = 0, n = 0;
-					uint8_t *pixels = stbi_load_from_memory((const stbi_uc *)png.data(), (int)png.size(), &w, &h, &n, 4);
-					if (pixels && w > 0 && h > 0) {
-						cover = squareCover(pixels, w, h);
-						writeFile(cache + e.id + ".png", png);
-						from = "game icon";
-						fetched++;
-					}
-					if (pixels) {
-						stbi_image_free(pixels);
-					}
-				}
-			}
-			if (cover.empty()) {
-				cover = demoCover((int)games.size());
-				from = "plain (no icon found)";
 			}
 			used.insert(e.id);
-			addGame(name, subtitle, cover, e.id, from, e.bytes, e.installed);
-			games.back().contentId = e.contentId;
+			Game &g = addGame(name, subtitle, e.id, e.bytes, e.installed);
+			g.contentId = e.contentId;
+			g.customPath = customPath;
+			g.cachePath = cache + e.id + ".png";
+			g.fetchId = live ? e.id : "";
 		}
 		// games.txt entries that are not in the installed list
 		for (const Custom &c : custom) {
 			if (!c.id.empty() && used.count(c.id)) {
 				continue;
 			}
-			std::vector<uint8_t> cover = c.image.empty() ? std::vector<uint8_t>() : loadCover(covers + c.image);
-			const std::string from = cover.empty() ? "plain" : "custom (games.txt)";
-			if (cover.empty()) {
-				cover = demoCover((int)games.size());
-			}
-			addGame(c.name.empty() ? c.image : c.name, c.subtitle, cover, c.id, from);
-		}
-		if (fetched) {
-			std::cerr << "Cover Flow: fetched " << fetched << " icons from the launcher\n";
+			Game &g = addGame(c.name.empty() ? c.image : cleanName(c.name), c.subtitle, c.id);
+			g.customPath = c.image.empty() ? "" : covers + c.image;
 		}
 	}
 
@@ -1147,12 +1452,7 @@ public:
 		// 4. What the sandbox can see (the PC reference build's test metadata)
 		scanInstalled();
 		for (const auto &g : installed) {
-			std::vector<uint8_t> cover = loadCover(g.icon);
-			const std::string from = cover.empty() ? "plain" : "game icon";
-			if (cover.empty()) {
-				cover = demoCover((int)games.size());
-			}
-			addGame(g.name, platformOf(g.id), cover, g.id, from);
+			addGame(cleanName(g.name), "", g.id).customPath = g.icon;
 		}
 		if (!games.empty()) {
 			listSource = "installed games";
@@ -1163,9 +1463,403 @@ public:
 			"Demo Title Five", "Demo Title Six", "Demo Title Seven", "Demo Title Eight", "Demo Title Nine",
 			"Demo Title Ten", "Demo Title Eleven", "Demo Title Twelve" };
 		for (int i = 0; i < 12; i++) {
-			addGame(names[i], "Load the Cover Flow launcher to show your games", demoCover(i), "", "demonstration");
+			addGame(names[i], "Load the Cover Flow launcher to show your games", "");
 		}
 		listSource = "demonstration covers";
+	}
+
+	// ---------------------------------------------------------------- files carried inside Cover Flow
+
+	// Cover Flow carries its shaders and its icon inside eboot.bin and writes
+	// them to the title folder when they are missing or different, so an update
+	// that replaces only eboot.bin still brings everything it needs
+	void installEmbedded()
+	{
+		int written = 0;
+		for (const auto &file : embeddedFiles) {
+			const std::string path = appRoot() + file.path;
+			std::string have;
+			if (readFile(path, have) && have.size() == file.size && std::memcmp(have.data(), file.data, file.size) == 0) {
+				continue;
+			}
+			// Make the folders, then write beside it and swap it in
+			for (size_t at = appRoot().size(); (at = path.find('/', at + 1)) != std::string::npos;) {
+				mkdir(path.substr(0, at).c_str(), 0777);
+			}
+			if (writeFile(path + ".tmp", std::string((const char *)file.data, file.size)) && std::rename((path + ".tmp").c_str(), path.c_str()) == 0) {
+				written++;
+			} else {
+				std::cerr << "Cover Flow: could not write " << path << "\n";
+			}
+		}
+		if (written) {
+			std::cerr << "Cover Flow: wrote " << written << " of its own files\n";
+		}
+	}
+
+	// ---------------------------------------------------------------- game artwork behind the covers
+
+	struct Art {
+		std::string id;
+		vks::Texture2D texture;
+		VkDescriptorSet set{ VK_NULL_HANDLE };
+		float aspect{ 1.0f };
+	};
+	std::vector<std::unique_ptr<Art>> arts; // the last few, oldest first
+	VkDescriptorPool artPool{ VK_NULL_HANDLE };
+	struct ArtJob {
+		std::mutex mutex;
+		bool done{ false };
+		std::string id;
+		std::vector<uint8_t> rgba;
+		int w{ 0 }, h{ 0 };
+	};
+	std::shared_ptr<ArtJob> artJob;
+	std::set<std::string> artMissing;
+	std::string artShown, artPrev;
+	float artAlpha{ 0.0f }, artPrevAlpha{ 0.0f }, settledFor{ 0.0f };
+
+	Art *findArt(const std::string &id)
+	{
+		for (auto &a : arts) {
+			if (a->id == id) {
+				return a.get();
+			}
+		}
+		return nullptr;
+	}
+
+	// Bilinear resize of RGBA pixels
+	static std::vector<uint8_t> resize(const uint8_t *pixels, int w, int h, int ow, int oh)
+	{
+		std::vector<uint8_t> out((size_t)ow * oh * 4);
+		for (int y = 0; y < oh; y++) {
+			for (int x = 0; x < ow; x++) {
+				const float sx = std::clamp((x + 0.5f) * w / ow - 0.5f, 0.0f, (float)(w - 1));
+				const float sy = std::clamp((y + 0.5f) * h / oh - 0.5f, 0.0f, (float)(h - 1));
+				const int ix = (int)sx, iy = (int)sy, ix1 = std::min(ix + 1, w - 1), iy1 = std::min(iy + 1, h - 1);
+				const float fx = sx - ix, fy = sy - iy;
+				for (int c = 0; c < 4; c++) {
+					const float a = pixels[(iy * w + ix) * 4 + c] * (1 - fx) + pixels[(iy * w + ix1) * 4 + c] * fx;
+					const float b = pixels[(iy1 * w + ix) * 4 + c] * (1 - fx) + pixels[(iy1 * w + ix1) * 4 + c] * fx;
+					out[((size_t)y * ow + x) * 4 + c] = (uint8_t)std::lround(a * (1 - fy) + b * fy);
+				}
+			}
+		}
+		return out;
+	}
+
+	void requestArt(const std::string &id)
+	{
+		auto job = std::make_shared<ArtJob>();
+		job->id = id;
+		artJob = job;
+		std::thread([job, id]() {
+			const std::string answer = askLauncher("art " + id, 24u << 20, 5);
+			const size_t nl = answer.find('\n');
+			std::vector<uint8_t> rgba;
+			int ow = 0, oh = 0;
+			if (answer.rfind("ok ", 0) == 0 && nl != std::string::npos) {
+				int w = 0, h = 0, n = 0;
+				uint8_t *pixels = stbi_load_from_memory((const stbi_uc *)answer.data() + nl + 1, (int)(answer.size() - nl - 1), &w, &h, &n, 4);
+				if (pixels && w > 0 && h > 0) {
+					// At most 960 wide: plenty behind dimmed covers, and quick to upload
+					ow = std::min(w, 960);
+					oh = std::max(1, h * ow / w);
+					rgba = resize(pixels, w, h, ow, oh);
+				}
+				if (pixels) {
+					stbi_image_free(pixels);
+				}
+			}
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->rgba = std::move(rgba);
+			job->w = ow;
+			job->h = oh;
+			job->done = true;
+		}).detach();
+	}
+
+	// Which artwork shows: the selected game's, once the row has settled on it
+	void updateArt(float dt)
+	{
+		const bool enabled = settings.artBackgrounds && listSource == "live" && !settings.grid;
+		const Game *g = current();
+		settledFor = (g && std::abs(selected - position) < 0.05f) ? settledFor + dt : 0.0f;
+		std::string target = enabled && g && settledFor > 0.25f ? g->titleId : (enabled ? artShown : "");
+		if (!enabled) {
+			target = "";
+		}
+		// A finished download becomes a texture
+		if (artJob) {
+			bool done;
+			{
+				std::lock_guard<std::mutex> lock(artJob->mutex);
+				done = artJob->done;
+			}
+			if (done) {
+				if (artJob->rgba.empty()) {
+					artMissing.insert(artJob->id);
+				} else {
+					if (arts.size() >= 6) {
+						// Forget the oldest that is not on screen
+						for (auto it = arts.begin(); it != arts.end(); ++it) {
+							if ((*it)->id != artShown && (*it)->id != artPrev) {
+								vkDeviceWaitIdle(device);
+								vkFreeDescriptorSets(device, artPool, 1, &(*it)->set);
+								(*it)->texture.destroy();
+								arts.erase(it);
+								break;
+							}
+						}
+					}
+					auto a = std::make_unique<Art>();
+					a->id = artJob->id;
+					a->texture.fromBuffer(artJob->rgba.data(), artJob->rgba.size(), VK_FORMAT_R8G8B8A8_SRGB, artJob->w, artJob->h, vulkanDevice, queue);
+					a->aspect = (float)artJob->w / (float)artJob->h;
+					VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(artPool, &descriptorSetLayout, 1);
+					if (vkAllocateDescriptorSets(device, &allocInfo, &a->set) == VK_SUCCESS) {
+						VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(a->set, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &a->texture.descriptor);
+						vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+						arts.push_back(std::move(a));
+					} else {
+						a->texture.destroy();
+					}
+				}
+				artJob.reset();
+			}
+		}
+		if (target != artShown) {
+			if (target.empty() || findArt(target)) {
+				artPrev = artShown;
+				artPrevAlpha = artAlpha;
+				artShown = target;
+				artAlpha = 0.0f;
+			} else if (!artJob && !artMissing.count(target)) {
+				requestArt(target);
+			} else if (artMissing.count(target)) {
+				// No artwork: fade out what was there
+				artPrev = artShown;
+				artPrevAlpha = artAlpha;
+				artShown = "";
+				artAlpha = 0.0f;
+			}
+		}
+		const float k = 1.0f - std::exp(-dt * 5.0f);
+		artAlpha += ((artShown.empty() ? 0.0f : 1.0f) - artAlpha) * k;
+		artPrevAlpha += (0.0f - artPrevAlpha) * k;
+	}
+
+	// ---------------------------------------------------------------- play time, storage, the clock
+
+	void loadPlayTime()
+	{
+		const std::string cache = appRoot() + "covers/auto/playtime.txt";
+		std::string text = listSource == "live" ? askLauncher("playtime", 1u << 20, 2) : "";
+		if (text.rfind("ok playtime", 0) == 0) {
+			writeFile(cache, text);
+		} else {
+			readFile(cache, text);
+		}
+		playTime.clear();
+		std::stringstream ss(text);
+		std::string line;
+		while (std::getline(ss, line)) {
+			std::stringstream ls(line);
+			std::string id;
+			PlayRecord r;
+			if (ls >> id >> r.seconds >> r.last >> r.count && isTitleId(id)) {
+				playTime[id] = r;
+			}
+		}
+	}
+
+	void loadStorage()
+	{
+		if (listSource != "live") {
+			return;
+		}
+		const std::string answer = trim(askLauncher("storage", 4096, 2));
+		long long freeBytes = 0, total = 0;
+		if (std::sscanf(answer.c_str(), "ok %lld %lld", &freeBytes, &total) == 2 && total > 0) {
+			storageText = formatSize(freeBytes) + " free";
+		}
+	}
+
+	static std::string formatDuration(long long seconds)
+	{
+		if (seconds <= 0) {
+			return "Not yet";
+		}
+		const long long h = seconds / 3600, m = (seconds % 3600) / 60;
+		if (h == 0) {
+			return std::to_string(std::max(1LL, m)) + " min";
+		}
+		return std::to_string(h) + " h " + std::to_string(m) + " min";
+	}
+
+	// The time in the console's time zone and clock format
+	std::string clockText() const
+	{
+		const time_t now = time(nullptr);
+		struct tm t;
+		int zone = 0, summer = 0, format = 1;
+		bool known = false;
+#if defined(VK_EXAMPLE_PS5) && !defined(PS5_HOST_REFERENCE)
+		known = cf_sceSystemServiceParamGetInt(4, &zone) == 0;
+		if (cf_sceSystemServiceParamGetInt(5, &summer) != 0) {
+			summer = 0;
+		}
+		if (cf_sceSystemServiceParamGetInt(3, &format) != 0) {
+			format = 1;
+		}
+#endif
+		if (known) {
+			const time_t shifted = now + (time_t)(zone + (summer ? 60 : 0)) * 60;
+			gmtime_r(&shifted, &t);
+		} else {
+			localtime_r(&now, &t);
+		}
+		char out[16];
+		if (format == 0) {
+			std::snprintf(out, sizeof(out), "%d:%02d %s", t.tm_hour % 12 == 0 ? 12 : t.tm_hour % 12, t.tm_min, t.tm_hour < 12 ? "AM" : "PM");
+		} else {
+			std::snprintf(out, sizeof(out), "%02d:%02d", t.tm_hour, t.tm_min);
+		}
+		return out;
+	}
+
+	// ---------------------------------------------------------------- the cover loader
+
+	// Decode every game's cover on a worker thread, nearest the selection first
+	void startCoverLoader()
+	{
+		struct Job {
+			int index;
+			std::string customPath, cachePath, fetchId;
+			int demoIndex;
+		};
+		std::vector<Job> jobs;
+		std::vector<int> order;
+		for (int k = 0; k < (int)view.size(); k++) {
+			order.push_back(view[k]);
+		}
+		std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+			auto at = [&](int g) {
+				for (int k = 0; k < (int)view.size(); k++) {
+					if (view[k] == g) {
+						return std::abs(k - selected);
+					}
+				}
+				return 1 << 20;
+			};
+			return at(a) < at(b);
+		});
+		std::set<int> queued(order.begin(), order.end());
+		for (int i = 0; i < (int)games.size(); i++) {
+			if (!queued.count(i)) {
+				order.push_back(i); // games the filter hides, last
+			}
+		}
+		for (int i : order) {
+			const Game &g = games[i];
+			jobs.push_back({ i, g.customPath, g.cachePath, g.fetchId, g.demoIndex });
+		}
+		auto results = coverResults;
+		std::thread([results, jobs]() {
+			for (const Job &job : jobs) {
+				std::vector<uint8_t> rgba;
+				std::string from;
+				if (!job.customPath.empty()) {
+					rgba = loadCover(job.customPath);
+					from = "custom (games.txt)";
+				}
+				if (rgba.empty() && !job.cachePath.empty()) {
+					rgba = loadCover(job.cachePath);
+					from = "game icon";
+				}
+				if (rgba.empty() && !job.fetchId.empty()) {
+					const std::string answer = askLauncher("icon " + job.fetchId);
+					const size_t nl = answer.find('\n');
+					if (answer.rfind("ok ", 0) == 0 && nl != std::string::npos) {
+						const std::string png = answer.substr(nl + 1);
+						int w = 0, h = 0, n = 0;
+						uint8_t *pixels = stbi_load_from_memory((const stbi_uc *)png.data(), (int)png.size(), &w, &h, &n, 4);
+						if (pixels && w > 0 && h > 0) {
+							rgba = squareCover(pixels, w, h);
+							writeFile(job.cachePath, png);
+							from = "game icon";
+							std::lock_guard<std::mutex> lock(results->mutex);
+							results->fetched++;
+						}
+						if (pixels) {
+							stbi_image_free(pixels);
+						}
+					}
+				}
+				if (rgba.empty()) {
+					rgba = demoCover(job.demoIndex);
+					from = job.fetchId.empty() && job.cachePath.empty() && job.customPath.empty() ? "demonstration" : "plain (no icon found)";
+				}
+				std::lock_guard<std::mutex> lock(results->mutex);
+				results->ready.push_back({ job.index, { std::move(rgba), from } });
+				results->done++;
+			}
+		}).detach();
+	}
+
+	// Upload the covers the worker has finished: a few each frame
+	void uploadCovers()
+	{
+		std::vector<std::pair<int, std::pair<std::vector<uint8_t>, std::string>>> batch;
+		{
+			std::lock_guard<std::mutex> lock(coverResults->mutex);
+			const size_t take = std::min<size_t>(coverResults->ready.size(), 6);
+			batch.assign(std::make_move_iterator(coverResults->ready.begin()), std::make_move_iterator(coverResults->ready.begin() + take));
+			coverResults->ready.erase(coverResults->ready.begin(), coverResults->ready.begin() + take);
+		}
+		for (auto &[index, item] : batch) {
+			Game &g = games[index];
+			if (g.loaded) {
+				continue;
+			}
+			g.texture.fromBuffer((void *)item.first.data(), item.first.size(), VK_FORMAT_R8G8B8A8_SRGB, coverSize, coverSize, vulkanDevice, queue);
+			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayout, 1);
+			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &g.descriptorSet));
+			VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(g.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &g.texture.descriptor);
+			vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+			g.coverFrom = item.second;
+			g.loaded = true;
+			coversLoaded++;
+		}
+	}
+
+	// The card shown until a cover has loaded
+	void makePlaceholder()
+	{
+		const uint32_t n = 64;
+		std::vector<uint8_t> rgba(n * n * 4);
+		for (uint32_t y = 0; y < n; y++) {
+			for (uint32_t x = 0; x < n; x++) {
+				const float t = (float)(x + y) / (2.0f * n);
+				const uint8_t v = (uint8_t)(34 + 22 * (1.0f - t));
+				uint8_t *p = &rgba[(y * n + x) * 4];
+				p[0] = v;
+				p[1] = (uint8_t)(v + 3);
+				p[2] = (uint8_t)(v + 12);
+				p[3] = 255;
+			}
+		}
+		placeholderTexture.fromBuffer(rgba.data(), rgba.size(), VK_FORMAT_R8G8B8A8_SRGB, n, n, vulkanDevice, queue);
+		VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayout, 1);
+		VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &placeholderSet));
+		VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(placeholderSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &placeholderTexture.descriptor);
+		vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+	}
+
+	VkDescriptorSet coverSet(const Game &g) const
+	{
+		return g.loaded ? g.descriptorSet : placeholderSet;
 	}
 
 	// ---------------------------------------------------------------- sort and filter
@@ -1202,6 +1896,31 @@ public:
 		// Cover Flow's own releases unless coverflow.ini names another repository
 		settings.updateRepo = ini.count("update_repo") && !ini["update_repo"].empty() ? ini["update_repo"] : "awaisa123/coverflow";
 		settings.quitWith = ini.count("quit_with") ? std::clamp(std::atoi(ini["quit_with"].c_str()), 0, 3) : 0;
+		settings.lastGame = ini.count("last_game") ? ini["last_game"] : "";
+		settings.artBackgrounds = flag("art_backgrounds", true);
+		settings.sounds = flag("sounds", true);
+		settings.grid = flag("grid", false);
+		settings.themeName = ini.count("theme_name") ? ini["theme_name"] : "";
+		if (ini.count("collections") && !ini["collections"].empty()) {
+			std::stringstream cs(ini["collections"]);
+			std::string name;
+			for (int c = 0; c < collectionCount && std::getline(cs, name, ','); c++) {
+				if (!trim(name).empty()) {
+					collectionNames[c] = trim(cleanName(name)).substr(0, 24);
+				}
+			}
+		}
+		collectionMembers.clear();
+		{
+			std::stringstream ms(ini["collection_members"]);
+			std::string pair;
+			while (std::getline(ms, pair, ',')) {
+				const size_t colon = pair.find(':');
+				if (colon != std::string::npos && isTitleId(trim(pair.substr(0, colon)))) {
+					collectionMembers[trim(pair.substr(0, colon))] = std::atoi(pair.c_str() + colon + 1) & 63;
+				}
+			}
+		}
 		sectionOverride.clear();
 		std::stringstream ss(ini["sections"]);
 		std::string pair;
@@ -1233,10 +1952,51 @@ public:
 			"\nfavourites = " + join(favourites) + "\nhidden = " + join(hidden) + "\nsections = " + sections +
 			"\nreturn_after_game = " + (settings.returnAfter ? "1" : "0") + "\ntheme = " + (settings.themeOn ? "1" : "0") +
 			"\nupdate_check = " + (settings.updateCheck ? "1" : "0") + "\nupdate_repo = " + settings.updateRepo +
-			"\nquit_with = " + std::to_string(settings.quitWith) +
+			"\nquit_with = " + std::to_string(settings.quitWith) + "\nlast_game = " + settings.lastGame +
 			"\nvolume = " + (settings.volume >= 0 ? std::to_string(settings.volume) : "") +
 			"\nreflection = " + (settings.reflection >= 0 ? std::to_string(settings.reflection) : "") +
-			"\nangle = " + (settings.angle >= 0 ? std::to_string(settings.angle) : "") + "\n");
+			"\nangle = " + (settings.angle >= 0 ? std::to_string(settings.angle) : "") +
+			"\nart_backgrounds = " + (settings.artBackgrounds ? "1" : "0") + "\nsounds = " + (settings.sounds ? "1" : "0") +
+			"\ngrid = " + (settings.grid ? "1" : "0") + "\ntheme_name = " + settings.themeName +
+			"\ncollections = " + collectionsLine() + "\ncollection_members = " + membersLine() + "\n");
+	}
+
+	std::string collectionsLine() const
+	{
+		std::string out;
+		for (const auto &n : collectionNames) {
+			out += (out.empty() ? "" : ",") + n;
+		}
+		return out;
+	}
+
+	std::string membersLine() const
+	{
+		std::string out;
+		for (const auto &[id, bits] : collectionMembers) {
+			if (bits) {
+				out += (out.empty() ? "" : ",") + id + ":" + std::to_string(bits);
+			}
+		}
+		return out;
+	}
+
+	// Keep the selected game for next time (not in test runs, which must stay the same)
+	void rememberSelection()
+	{
+#if defined(VK_EXAMPLE_PS5)
+		if (ps5.frameBudget || !prepared) {
+			return;
+		}
+#endif
+		const Game *g = current();
+		if (restoredRestart) {
+			return; // the restored settings stay as they are
+		}
+		if (g && !g->titleId.empty() && g->titleId != settings.lastGame) {
+			settings.lastGame = g->titleId;
+			saveSettings();
+		}
 	}
 
 	bool isFavourite(const Game &g) const { return !g.titleId.empty() && favourites.count(g.titleId); }
@@ -1259,7 +2019,8 @@ public:
 			const std::string &p = g.section;
 			const bool shown = filterMode == 6 ? isHidden(g)
 				: !isHidden(g) && (filterMode == 0 || (filterMode == 1 && isFavourite(g)) || (filterMode == 2 && p == "PS5") ||
-					(filterMode == 3 && p == "PS4") || (filterMode == 4 && p == "Emulators") || (filterMode == 5 && p == "Homebrew"));
+					(filterMode == 3 && p == "PS4") || (filterMode == 4 && p == "Emulators") || (filterMode == 5 && p == "Homebrew") ||
+					(filterMode >= baseFilters && inCollection(g, filterMode - baseFilters)));
 			if (shown) {
 				view.push_back(i);
 			}
@@ -1271,6 +2032,14 @@ public:
 			}
 			if (sortMode == 2 && x.installed != y.installed) {
 				return x.installed > y.installed;
+			}
+			if (sortMode == 3 || sortMode == 4) {
+				auto px = playTime.find(x.titleId), py = playTime.find(y.titleId);
+				const long long ax = px == playTime.end() ? 0 : (sortMode == 3 ? px->second.last : px->second.seconds);
+				const long long ay = py == playTime.end() ? 0 : (sortMode == 3 ? py->second.last : py->second.seconds);
+				if (ax != ay) {
+					return ax > ay;
+				}
 			}
 			return lower(x.title) < lower(y.title);
 		});
@@ -1288,7 +2057,8 @@ public:
 
 	void setupDescriptors()
 	{
-		const uint32_t count = (uint32_t)games.size() + 1;
+		// One set per game (allocated as its cover arrives), the placeholder and the backdrop
+		const uint32_t count = (uint32_t)games.size() + 2;
 		std::vector<VkDescriptorPoolSize> poolSizes = {
 			vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, count),
 		};
@@ -1299,14 +2069,16 @@ public:
 		};
 		VkDescriptorSetLayoutCreateInfo layoutInfo = vks::initializers::descriptorSetLayoutCreateInfo(bindings);
 		VK_CHECK_RESULT(vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout));
-		for (auto &game : games) {
-			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayout, 1);
-			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &game.descriptorSet));
-			VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(game.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &game.texture.descriptor);
-			vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+		makePlaceholder();
+		// Artwork and theme pictures come and go: their own pool, whose sets can be freed
+		{
+			std::vector<VkDescriptorPoolSize> artSizes = { vks::initializers::descriptorPoolSize(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 12) };
+			VkDescriptorPoolCreateInfo artInfo = vks::initializers::descriptorPoolCreateInfo(artSizes, 12);
+			artInfo.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+			VK_CHECK_RESULT(vkCreateDescriptorPool(device, &artInfo, nullptr, &artPool));
 		}
 		if (theme.hasPicture) {
-			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(descriptorPool, &descriptorSetLayout, 1);
+			VkDescriptorSetAllocateInfo allocInfo = vks::initializers::descriptorSetAllocateInfo(artPool, &descriptorSetLayout, 1);
 			VK_CHECK_RESULT(vkAllocateDescriptorSets(device, &allocInfo, &backgroundSet));
 			VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(backgroundSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &backgroundTexture.descriptor);
 			vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
@@ -1374,6 +2146,9 @@ public:
 		stages[0] = loadShader(getShadersPath() + "coverflow/background.vert.spv", VK_SHADER_STAGE_VERTEX_BIT);
 		stages[1] = loadShader(getShadersPath() + "coverflow/background.frag.spv", VK_SHADER_STAGE_FRAGMENT_BIT);
 		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelines.background));
+		// The game artwork layers: the backdrop's shaders, blended over it
+		blend.blendEnable = VK_TRUE;
+		VK_CHECK_RESULT(vkCreateGraphicsPipelines(device, pipelineCache, 1, &pipelineCI, nullptr, &pipelines.art));
 	}
 
 	void prepare() override
@@ -1385,13 +2160,14 @@ public:
 			ensureLauncher();
 		}
 #endif
-		if (settings.themeOn) {
-			loadTheme();
-		}
-		applySettings();
+		makeSounds();
+		applyTheme(currentTheme(), false);
+		startAudio();
 		loadLibrary();
 		loadSettings(); // the sections it names need the library's games
 		loadSizes();
+		loadPlayTime();
+		loadStorage();
 		for (auto &g : games) {
 			g.section = sectionOf(g);
 			g.subtitle = g.subtitle.empty() || g.subtitle == "PS5" || g.subtitle == "PS4" ? (g.section == "Other" ? "" : g.section) : g.subtitle;
@@ -1423,10 +2199,32 @@ public:
 				categoryIndex = 3;
 			}
 			settingsOpen = test.find("settings") != std::string::npos;
+			if (test.find("launcher") != std::string::npos) {
+				launcherPanel = true;
+				logLines = { "cflaunch 7: listening", "ps5vkctl: command list", "cflaunch: listed 49 titles", "cflaunch: PPSA03541 played 5400 s (total 50400 s)" };
+				launcherStatus = "running (version 7)";
+			}
+			if (test.find("notes") != std::string::npos) {
+				updateNotes = "What's new\n- Game artwork behind the covers\n- Play time and Recently played\n- Grid view on L3\n- Collections and themes";
+			}
+			if (test.find("grid") != std::string::npos) {
+				settings.grid = true;
+			}
+			if (test.find("letter") != std::string::npos) {
+				letterShown = "R";
+				letterTimer = 30.0f;
+			}
+			if (test.find("collections") != std::string::npos) {
+				collectionsOpen = true;
+				collectionMembers["CUSA00001"] = 1 | 4;
+			}
 			if (test.find("update") != std::string::npos) {
 				updateDialog = true;
-				updateTag = "v8";
+				updateTag = "v14";
 				settings.updateRepo = "example/coverflow";
+			}
+			if (test.find("toast") != std::string::npos) {
+				showMessage("Old Rally added to favourites", 30.0f);
 			}
 			if (test.find("fav=") != std::string::npos) {
 				favourites.insert(test.substr(test.find("fav=") + 4, 9));
@@ -1434,6 +2232,14 @@ public:
 		}
 #endif
 		rebuildView();
+		// Back on the game that was selected last time
+		for (int k = 0; k < (int)view.size(); k++) {
+			if (!settings.lastGame.empty() && games[view[k]].titleId == settings.lastGame) {
+				selected = k;
+				position = (float)k;
+			}
+		}
+		installEmbedded();
 		setupDescriptors();
 		preparePipelines();
 #if defined(VK_EXAMPLE_PS5)
@@ -1457,8 +2263,28 @@ public:
 		}
 #endif
 #endif
+		gridScroll = (float)(selected / gridCols);
+		startCoverLoader();
+#if defined(VK_EXAMPLE_PS5)
+		if (ps5.frameBudget) {
+			// A test run's picture has every cover: wait for them here
+			for (int wait = 0; wait < 2000; wait++) {
+				uploadCovers();
+				if (coversLoaded >= (int)games.size()) {
+					break;
+				}
+				usleep(10000);
+			}
+			loadingFade = 0.0f;
+			introTime = 10.0f;
+		} else {
+			pad_light_bar((uint8_t)(theme.accent.r * 255), (uint8_t)(theme.accent.g * 255), (uint8_t)(theme.accent.b * 255));
+		}
+#endif
 		prepared = true;
 	}
+	float introTime{ 0.0f }; // seconds since the first frame: the fade-in
+	float menuAnim{ 0.0f }, settingsAnim{ 0.0f }, dialogAnim{ 0.0f }, loadingAnim{ 1.0f };
 
 	// ---------------------------------------------------------------- layout
 
@@ -1479,7 +2305,12 @@ public:
 		const float aspect = (float)width / (float)height;
 		projection = glm::perspective(glm::radians(30.0f), aspect, 0.1f, 50.0f);
 		projection[1][1] *= -1.0f;
-		view3d = glm::lookAt(glm::vec3(0.0f, 0.78f, 4.6f), glm::vec3(0.0f, 0.36f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		if (settings.grid) {
+			// The grid: straight on
+			view3d = glm::lookAt(glm::vec3(0.0f, 0.0f, 6.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		} else {
+			view3d = glm::lookAt(glm::vec3(0.0f, 0.78f, 4.6f), glm::vec3(0.0f, 0.36f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+		}
 	}
 
 	// ---------------------------------------------------------------- launching
@@ -1510,6 +2341,8 @@ public:
 		const std::string answer = trim(askLauncher("switch " + self + " " + game.titleId + (settings.returnAfter ? " return" : "")));
 		logLaunch("  launcher: " + (answer.empty() ? std::string("no answer on port 9112") : answer));
 		if (answer.rfind("ok", 0) == 0) {
+			playSound(1);
+			rememberSelection();
 			// The launcher starts the game once Cover Flow has gone
 			showMessage("Starting " + game.title + "...", 10.0f);
 #if defined(VK_EXAMPLE_PS5)
@@ -1542,81 +2375,453 @@ public:
 		return std::to_string((int)std::lround(v * 100.0f)) + "%";
 	}
 
-	std::vector<std::string> settingsItems() const
+	// The settings lines, in order (the groups start at the first of each)
+	enum SettingId { S_RETURN, S_GRID, S_ART, S_THEME, S_MUSIC, S_SOUNDS, S_REFLECT, S_ANGLE, S_UPDATE_CHECK, S_UPDATE_SOURCE,
+		S_CHECK_NOW, S_LAUNCHER, S_BACKUP, S_RESTORE, S_QUIT_WITH, S_QUIT, S_COUNT };
+
+	// Each settings line: its label and its value ("" for actions)
+	std::vector<std::pair<std::string, std::string>> settingsItems() const
 	{
 		const float volume = settings.volume >= 0 ? settings.volume : theme.volume;
+		static const char *quitShort[4] = { "OPTIONS + SHARE", "L1 + R1 + OPTIONS", "Hold CIRCLE", "Settings only" };
+		auto onOff = [](bool b) { return std::string(b ? "On" : "Off"); };
 		return {
-			std::string("Come back to Cover Flow after a game:  ") + (settings.returnAfter ? "On" : "Off"),
-			"Music volume:  " + (musicPlaying ? percent(volume) : std::string("no music in the theme")),
-			"Reflections:  " + percent(theme.reflection),
-			"Cover angle:  " + std::to_string((int)std::lround(theme.sideAngle)) + " degrees",
-			std::string("Theme:  ") + (settings.themeOn ? "On" : "Off") + "  (applies when Cover Flow next opens)",
-			std::string("Check for updates when opening:  ") + (settings.updateCheck ? "On" : "Off"),
-			"Update source:  github.com/" + settings.updateRepo,
-			"Check for updates now",
-			"Reload the launcher  (" + launcherStatus + ")",
-			std::string("Quit with:  ") + quitNames[settings.quitWith],
-			"Quit Cover Flow",
+			{ "Return to Cover Flow after a game", onOff(settings.returnAfter) },
+			{ "Grid view  (L3)", onOff(settings.grid) },
+			{ "Game artwork behind the covers", onOff(settings.artBackgrounds) },
+			{ "Theme", currentTheme() },
+			{ "Music volume", musicFrames.empty() ? std::string("No music in theme") : percent(volume) },
+			{ "Sounds", onOff(settings.sounds) },
+			{ "Reflections", percent(theme.reflection) },
+			{ "Cover angle", std::to_string((int)std::lround(theme.sideAngle)) + "\xC2\xB0" },
+			{ "Check for updates on start", onOff(settings.updateCheck) },
+			{ "Update source", "github.com/" + settings.updateRepo },
+			{ "Check for updates now", "" },
+			{ "Launcher", launcherStatus },
+			{ "Back up settings to USB", "" },
+			{ "Restore settings from USB", "" },
+			{ "Quit with", quitShort[settings.quitWith] },
+			{ "Quit Cover Flow", "" },
 		};
+	}
+
+	// Which settings lines change with LEFT / RIGHT
+	static bool settingAdjustable(int index)
+	{
+		return index <= S_ANGLE || index == S_UPDATE_CHECK || index == S_QUIT_WITH;
 	}
 
 	// LEFT/RIGHT (delta) or CROSS (delta 0) on a settings line
 	void settingsChange(int index, int delta)
 	{
 		const int step = delta == 0 ? 1 : delta;
+		const std::string self = ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId;
 		switch (index) {
-		case 0:
+		case S_RETURN:
 			settings.returnAfter = !settings.returnAfter;
 			break;
-		case 1:
-			if (musicPlaying) {
+		case S_GRID:
+			settings.grid = !settings.grid;
+			gridScroll = (float)(selected / gridCols);
+			break;
+		case S_ART:
+			settings.artBackgrounds = !settings.artBackgrounds;
+			break;
+		case S_THEME: {
+			const std::vector<std::string> names = themeNames();
+			int at = 0;
+			for (int i = 0; i < (int)names.size(); i++) {
+				if (names[i] == currentTheme()) {
+					at = i;
+				}
+			}
+			at = (at + step + (int)names.size()) % (int)names.size();
+			settings.themeName = names[at];
+			settings.themeOn = true;
+			applyTheme(names[at], true);
+			showMessage("Theme: " + names[at] + (themeFolder(names[at]).empty() ? "" : "  (its font shows from the next start)"), 3.0f);
+			break;
+		}
+		case S_MUSIC:
+			if (!musicFrames.empty()) {
 				const float v = settings.volume >= 0 ? settings.volume : theme.volume;
 				settings.volume = std::clamp(std::round((v + 0.1f * step) * 10.0f) / 10.0f, 0.0f, 1.0f);
 			}
 			break;
-		case 2:
+		case S_SOUNDS:
+			settings.sounds = !settings.sounds;
+			startAudio();
+			break;
+		case S_REFLECT:
 			settings.reflection = std::clamp(std::round((theme.reflection + 0.1f * step) * 10.0f) / 10.0f, 0.0f, 1.0f);
 			break;
-		case 3:
+		case S_ANGLE:
 			settings.angle = std::clamp(theme.sideAngle + 5.0f * step, 30.0f, 85.0f);
 			break;
-		case 4:
-			settings.themeOn = !settings.themeOn;
-			break;
-		case 5:
+		case S_UPDATE_CHECK:
 			settings.updateCheck = !settings.updateCheck;
 			break;
-		case 6:
+		case S_UPDATE_SOURCE:
 			if (delta == 0) {
-				showMessage("Set update_repo = owner/repo in /data/homebrew/" + (ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId) + "/coverflow.ini", 6.0f);
+				showMessage("To change it: update_repo = owner/repo in /data/homebrew/" + self + "/coverflow.ini", 6.0f);
 			}
 			return;
-		case 7:
+		case S_CHECK_NOW:
 			if (delta == 0) {
 				checkForUpdate(true);
 			}
 			return;
-		case 8:
+		case S_LAUNCHER:
 			if (delta == 0) {
-				ensureLauncher(true);
-				showMessage("Launcher: " + launcherStatus, 4.0f);
+				openLauncherPanel();
 			}
 			return;
-		case 9:
+		case S_BACKUP:
+		case S_RESTORE:
+			if (delta == 0 && !toolJob) {
+				saveSettings();
+				toolRestore = index == S_RESTORE;
+				toolJob = askInBackground((toolRestore ? "restore " : "backup ") + self, 20);
+				showMessage(toolRestore ? "Restoring from USB..." : "Backing up to USB...", 20.0f);
+			}
+			return;
+		case S_QUIT_WITH:
 			settings.quitWith = (settings.quitWith + (delta < 0 ? 3 : 1)) % 4;
 			showMessage(std::string("Quit with: ") + quitNames[settings.quitWith], 3.0f);
 			break;
-		case 10:
+		case S_QUIT:
 			if (delta == 0) {
 				quit = true;
 			}
 			return;
 		}
+		playSound(1);
 		applySettings();
 		saveSettings();
 	}
 
+	// ---- backup, restore and the launcher panel
+
+	std::shared_ptr<Pending> toolJob, logJob;
+	bool toolRestore{ false };
+	bool launcherPanel{ false };
+	std::vector<std::string> logLines;
+
+	void openLauncherPanel()
+	{
+		launcherPanel = true;
+		logLines = { "Reading the launcher's log..." };
+		logJob = askInBackground("log", 5);
+		const int running = launcherRunning();
+		launcherStatus = running ? "running (version " + std::to_string(running) + ")" : "not running";
+	}
+
+	void pollTools()
+	{
+		std::string answer;
+		if (finished(toolJob, answer)) {
+			toolJob.reset();
+			if (answer.rfind("ok ", 0) == 0) {
+				if (toolRestore) {
+					// Start again with what was restored
+					showMessage("Restored. Cover Flow will close - open it again to use the restored settings.", 8.0f);
+					restoredRestart = true;
+					closeAfterUpdate = 5.0f;
+				} else {
+					showMessage("Backed up to " + answer.substr(3, answer.rfind(' ') - 3), 4.0f);
+				}
+			} else {
+				showMessage((toolRestore ? "Restore: " : "Backup: ") + (answer.empty() ? std::string("the launcher did not answer") : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0)), 5.0f);
+				playSound(3);
+			}
+		}
+		if (finished(logJob, answer)) {
+			logJob.reset();
+			logLines.clear();
+			std::stringstream ss(answer);
+			std::string line;
+			while (std::getline(ss, line)) {
+				if (line != "ok log" && line != "end") {
+					logLines.push_back(line);
+				}
+			}
+			if (logLines.empty()) {
+				logLines.push_back(answer.empty() ? "The launcher did not answer" : "The log is empty");
+			}
+		}
+	}
+	bool restoredRestart{ false };
+
 	// ---------------------------------------------------------------- updates
+
+	// ---- downloading from inside Cover Flow
+
+	// GET a URL into a string and/or a file, hashing as it goes: the HTTP status,
+	// or -1 with the console's error code in 'code'
+	static int webGet(const std::string &url, std::string *out, FILE *file, Sha256 *hash, uint32_t &code)
+	{
+#if defined(VK_EXAMPLE_PS5) && !defined(PS5_HOST_REFERENCE)
+		static std::mutex lock;
+		static int tmpl = -1;
+		std::lock_guard<std::mutex> guard(lock);
+		if (tmpl < 0) {
+			(void)cf_sceNetInit();
+			const int net = cf_sceNetPoolCreate("coverflow", 64 * 1024, 0);
+			const int ssl = cf_sceSslInit(512 * 1024);
+			const int http = net >= 0 && ssl >= 0 ? cf_sceHttp2Init(net, ssl, 512 * 1024, 2) : -1;
+			tmpl = http >= 0 ? cf_sceHttp2CreateTemplate(http, (std::string("CoverFlow/") + coverFlowVersion).c_str(), 3, 1) : -1;
+			std::cerr << "Cover Flow: https net=" << net << " ssl=" << ssl << " http2=" << http << " template=" << tmpl << "\n";
+			if (tmpl < 0) {
+				code = (uint32_t)(http < 0 ? http : tmpl);
+				return -1;
+			}
+		}
+		const int request = cf_sceHttp2CreateRequestWithURL(tmpl, "GET", url.c_str(), 0);
+		if (request < 0) {
+			code = (uint32_t)request;
+			return -1;
+		}
+		int status = -1;
+		const int sent = cf_sceHttp2SendRequest(request, nullptr, 0);
+		if (sent != 0 || cf_sceHttp2GetStatusCode(request, &status) != 0) {
+			cf_sceHttp2DeleteRequest(request);
+			code = (uint32_t)sent;
+			std::cerr << "Cover Flow: GET " << url << " failed: 0x" << std::hex << (uint32_t)sent << std::dec << "\n";
+			return -1;
+		}
+		if (status == 200) {
+			char buffer[16384];
+			int got;
+			while ((got = cf_sceHttp2ReadData(request, buffer, sizeof(buffer))) > 0) {
+				if (hash) {
+					hash->update(buffer, (size_t)got);
+				}
+				if (file && std::fwrite(buffer, 1, (size_t)got, file) != (size_t)got) {
+					status = -3;
+					break;
+				}
+				if (out) {
+					out->append(buffer, (size_t)got);
+				}
+			}
+		}
+		cf_sceHttp2DeleteRequest(request);
+		std::cerr << "Cover Flow: GET " << url << " -> " << status << "\n";
+		return status;
+#else
+		(void)url;
+		(void)out;
+		(void)file;
+		(void)hash;
+		code = 0;
+		return -1; // the PC reference build does not download
+#endif
+	}
+
+	static std::string hexCode(uint32_t code)
+	{
+		char s[16];
+		std::snprintf(s, sizeof(s), "0x%08x", code);
+		return s;
+	}
+
+	static int versionNumber(const std::string &tag)
+	{
+		return std::atoi(tag.c_str() + (tag.size() && (tag[0] == 'v' || tag[0] == 'V') ? 1 : 0));
+	}
+
+	// The newest release's tag and its part of GitHub's JSON, or an error. The
+	// "latest" release first; when there is none (every release marked as a
+	// pre-release), the highest vN among the most recent releases
+	static bool latestRelease(const std::string &repo, std::string &tag, std::string &json, std::string &error)
+	{
+		uint32_t code = 0;
+		const int status = webGet("https://api.github.com/repos/" + repo + "/releases/latest", &json, nullptr, nullptr, code);
+		if (status == 200) {
+			tag = jsonString(json, "tag_name");
+			if (!tag.empty()) {
+				return true;
+			}
+		}
+		if (status == -1) {
+			error = "could not connect (" + hexCode(code) + ")";
+			return false;
+		}
+		std::string list;
+		const int listed = webGet("https://api.github.com/repos/" + repo + "/releases?per_page=10", &list, nullptr, nullptr, code);
+		if (listed != 200) {
+			error = "GitHub answered " + std::to_string(status == 200 ? listed : status);
+			return false;
+		}
+		// Each release's part runs from its "tag_name" to the next one's
+		std::vector<size_t> starts;
+		for (size_t at = 0; (at = list.find("\"tag_name\"", at)) != std::string::npos; at += 10) {
+			starts.push_back(at);
+		}
+		int best = -1;
+		for (size_t i = 0; i < starts.size(); i++) {
+			const std::string t = jsonString(list, "tag_name", starts[i]);
+			if (best < 0 || versionNumber(t) > versionNumber(tag)) {
+				best = (int)i;
+				tag = t;
+			}
+		}
+		if (best < 0) {
+			error = "the repository has no releases";
+			return false;
+		}
+		const size_t from = starts[best], to = (size_t)best + 1 < starts.size() ? starts[best + 1] : list.size();
+		json = list.substr(from, to - from);
+		return true;
+	}
+
+	// A release's description, with its line breaks, for the update dialog
+	static std::string releaseNotes(const std::string &json)
+	{
+		const size_t k = json.find("\"body\"");
+		if (k == std::string::npos) {
+			return "";
+		}
+		size_t q = json.find(':', k);
+		if (q == std::string::npos) {
+			return "";
+		}
+		q = json.find_first_not_of(" \t\r\n", q + 1);
+		if (q == std::string::npos || json[q] != '"') {
+			return ""; // null: no description
+		}
+		std::string out;
+		for (size_t i = q + 1; i < json.size() && json[i] != '"'; i++) {
+			if (json[i] == '\\' && i + 1 < json.size()) {
+				const char e = json[++i];
+				if (e == 'n') {
+					out += '\n';
+				} else if (e == 'r') {
+				} else if (e == 'u' && i + 4 < json.size()) {
+					i += 4; // symbols the font cannot draw anyway
+				} else {
+					out += e;
+				}
+			} else {
+				out += json[i];
+			}
+			if (out.size() > 4000) {
+				break;
+			}
+		}
+		return out;
+	}
+
+	static std::string assetUrl(const std::string &json, const std::string &name)
+	{
+		for (size_t at = 0; (at = json.find("\"browser_download_url\"", at)) != std::string::npos; at += 22) {
+			const std::string url = jsonString(json, "browser_download_url", at);
+			if (url.size() > name.size() && url[url.size() - name.size() - 1] == '/' &&
+				url.compare(url.size() - name.size(), name.size(), name) == 0) {
+				return url;
+			}
+		}
+		return "";
+	}
+
+	static bool safePath(const std::string &p)
+	{
+		if (p.empty() || p[0] == '/' || p.size() > 160 || p.find("..") != std::string::npos) {
+			return false;
+		}
+		for (char c : p) {
+			if (!(c == '/' || c == '-' || c == '_' || c == '.' || std::isalnum((unsigned char)c))) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	// The check, from inside Cover Flow: "ok <tag>" or "err ..."
+	static std::string appCheck(const std::string &repo)
+	{
+		std::string tag, json, error;
+		if (!latestRelease(repo, tag, json, error)) {
+			return "err " + error;
+		}
+		if (assetUrl(json, "SHA256SUMS").empty() || assetUrl(json, "eboot.bin").empty()) {
+			return "err release " + tag + " lacks SHA256SUMS or eboot.bin";
+		}
+		return "ok " + tag + "\n" + releaseNotes(json);
+	}
+
+	// The update, from inside Cover Flow: every file SHA256SUMS lists, each
+	// checked; only when all match are they put in place. "ok <tag> <n>" or "err ..."
+	static std::string appApply(const std::string &repo, const std::string &root)
+	{
+		std::string tag, json, error, sums;
+		if (!latestRelease(repo, tag, json, error)) {
+			return "err " + error;
+		}
+		uint32_t code = 0;
+		const std::string sumsUrl = assetUrl(json, "SHA256SUMS");
+		if (sumsUrl.empty() || webGet(sumsUrl, &sums, nullptr, nullptr, code) != 200) {
+			return "err could not download SHA256SUMS";
+		}
+		std::vector<std::pair<std::string, std::string>> files; // path, sha256
+		std::stringstream ss(sums);
+		std::string line;
+		bool eboot = false;
+		while (std::getline(ss, line)) {
+			std::stringstream ls(line);
+			std::string hex, path;
+			if (!(ls >> hex >> path) || hex.size() != 64) {
+				continue;
+			}
+			if (path[0] == '*') {
+				path = path.substr(1);
+			}
+			if (!safePath(path)) {
+				return "err SHA256SUMS names an unsafe path: " + path;
+			}
+			files.push_back({ path, lower(hex) });
+			eboot |= path == "eboot.bin";
+		}
+		if (!eboot) {
+			return "err SHA256SUMS does not list eboot.bin";
+		}
+		auto removeNew = [&](size_t upTo) {
+			for (size_t j = 0; j <= upTo && j < files.size(); j++) {
+				std::remove((root + files[j].first + ".new").c_str());
+			}
+		};
+		for (size_t i = 0; i < files.size(); i++) {
+			std::string asset = files[i].first;
+			for (size_t at; (at = asset.find('/')) != std::string::npos;) {
+				asset.replace(at, 1, "__");
+			}
+			const std::string target = root + files[i].first + ".new";
+			for (size_t at = root.size(); (at = target.find('/', at + 1)) != std::string::npos;) {
+				mkdir(target.substr(0, at).c_str(), 0777);
+			}
+			const std::string url = assetUrl(json, asset);
+			FILE *file = url.empty() ? nullptr : std::fopen(target.c_str(), "wb");
+			Sha256 hash;
+			const int status = file ? webGet(url, nullptr, file, &hash, code) : -1;
+			if (file) {
+				std::fclose(file);
+			}
+			if (status != 200 || hash.hex() != files[i].second) {
+				removeNew(i);
+				return "err " + files[i].first + ": " + (status != 200 ? "could not download it" : "SHA-256 does not match") +
+					" - nothing was changed";
+			}
+		}
+		for (const auto &f : files) {
+			if (std::rename((root + f.first + ".new").c_str(), (root + f.first).c_str()) != 0) {
+				return "err could not replace " + f.first;
+			}
+		}
+		return "ok " + tag + " " + std::to_string(files.size());
+	}
+
+	// Which way the last check reached GitHub: 1 from inside Cover Flow, 2 through the launcher
+	int updateRoute{ 0 };
 
 	void checkForUpdate(bool byHand)
 	{
@@ -1629,7 +2834,27 @@ public:
 		if (updateCheckJob) {
 			return;
 		}
-		updateCheckJob = askInBackground("update-check " + settings.updateRepo, 30);
+		// From inside Cover Flow first; through the launcher if that cannot connect
+		auto job = std::make_shared<Pending>();
+		const std::string repo = settings.updateRepo;
+		std::thread([job, repo]() {
+			std::string answer = appCheck(repo);
+			std::string route = "1";
+			if (answer.rfind("ok", 0) != 0) {
+				const std::string viaLauncher = trim(askLauncher("update-check " + repo, 1u << 20, 30));
+				if (viaLauncher.rfind("ok", 0) == 0) {
+					answer = viaLauncher;
+					route = "2";
+				} else {
+					answer = "err from Cover Flow: " + answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0) + "; from the launcher: " +
+						(viaLauncher.empty() ? std::string("no answer") : viaLauncher.substr(viaLauncher.rfind("err ", 0) == 0 ? 4 : 0));
+				}
+			}
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->answer = route + answer;
+			job->done = true;
+		}).detach();
+		updateCheckJob = job;
 		checkByHand = byHand;
 		if (byHand) {
 			showMessage("Checking " + settings.updateRepo + "...", 30.0f);
@@ -1653,14 +2878,20 @@ public:
 		std::string answer;
 		if (finished(updateCheckJob, answer)) {
 			updateCheckJob.reset();
+			updateRoute = answer.empty() ? 0 : answer[0] - '0';
+			answer = answer.empty() ? answer : answer.substr(1);
 			if (answer.rfind("ok ", 0) == 0) {
-				updateTag = trim(answer.substr(3));
-				if (updateTag != coverFlowVersion) {
+				const size_t nl = answer.find('\n');
+				updateTag = trim(answer.substr(3, nl == std::string::npos ? std::string::npos : nl - 3));
+				updateNotes = nl == std::string::npos ? "" : answer.substr(nl + 1);
+				// Only a newer version: "v12" is newer than "v11" (the numbers after the v)
+				auto number = [](const std::string &tag) { return std::atoi(tag.c_str() + (tag.size() && (tag[0] == 'v' || tag[0] == 'V') ? 1 : 0)); };
+				if (number(updateTag) > number(coverFlowVersion)) {
 					updateDialog = true;
 					updateChoice = 0;
 					messageTimer = 0.0f;
 				} else if (checkByHand) {
-					showMessage(std::string("Cover Flow is up to date (") + coverFlowVersion + ")", 3.0f);
+					showMessage(std::string("Cover Flow is up to date (") + coverFlowVersion + (updateRoute == 1 ? ", checked by Cover Flow)" : ", checked by the launcher)"), 4.0f);
 				}
 			} else if (checkByHand) {
 				showMessage("Update check: " + (answer.empty() ? std::string("the launcher did not answer") : answer), 6.0f);
@@ -1670,11 +2901,10 @@ public:
 			updateApplyJob.reset();
 			updating = false;
 			if (answer.rfind("ok", 0) == 0) {
-				// Installed: the launcher restarts Cover Flow once it has quit
-				const std::string self = ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId;
-				askLauncher("switch " + self + " " + self);
-				showMessage("Updated to " + updateTag + " - restarting", 10.0f);
-				quit = true;
+				// Installed. Restarting a title from inside itself froze the console
+				// (v13), so Cover Flow closes on its own and is opened again by hand.
+				showMessage("Updated to " + updateTag + ". Cover Flow will close - open it again from the home screen.", 8.0f);
+				closeAfterUpdate = 5.0f;
 			} else {
 				showMessage("Update failed: " + (answer.empty() ? std::string("no answer from the launcher") : answer), 8.0f);
 			}
@@ -1684,7 +2914,19 @@ public:
 	void startUpdate()
 	{
 		const std::string self = ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId;
-		updateApplyJob = askInBackground("update-apply " + settings.updateRepo + " " + self, 600);
+		if (updateRoute == 2) {
+			updateApplyJob = askInBackground("update-apply " + settings.updateRepo + " " + self, 600);
+		} else {
+			auto job = std::make_shared<Pending>();
+			const std::string repo = settings.updateRepo, root = appRoot();
+			std::thread([job, repo, root]() {
+				const std::string answer = appApply(repo, root);
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->answer = answer;
+				job->done = true;
+			}).detach();
+			updateApplyJob = job;
+		}
 		updating = true;
 		updateDialog = false;
 		showMessage("Downloading " + updateTag + " and checking it...", 600.0f);
@@ -1761,7 +3003,36 @@ public:
 	{
 		return { "Start game", isFavourite(g) ? "Remove from favourites" : "Add to favourites",
 			"Category:  " + categoryName(g.section) + (sectionOverride.count(g.titleId) ? "" : "  (automatic)"),
+			"Collections:  " + collectionSummary(g),
 			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow", "Close" };
+	}
+
+	std::string collectionSummary(const Game &g) const
+	{
+		std::string out;
+		int n = 0;
+		for (int c = 0; c < collectionCount; c++) {
+			if (inCollection(g, c)) {
+				out += (n++ ? ", " : "") + collectionNames[c];
+			}
+		}
+		return n ? out : "none";
+	}
+
+	void toggleCollection(int c)
+	{
+		const Game *g = current();
+		if (!g || g->titleId.empty()) {
+			showMessage("Only games with a title id can join a collection", 3.0f);
+			return;
+		}
+		int &bits = collectionMembers[g->titleId];
+		bits ^= 1 << c;
+		showMessage(g->title + ((bits >> c & 1) ? " added to " : " removed from ") + collectionNames[c], 2.5f);
+		saveSettings();
+		if (filterMode >= baseFilters) {
+			rebuildView();
+		}
 	}
 
 	void menuAction(int index)
@@ -1808,6 +3079,10 @@ public:
 			break;
 		}
 		case 3:
+			collectionsOpen = true;
+			collectionIndex = 0;
+			break;
+		case 4:
 			if (id.empty()) {
 				showMessage("Only games with a title id can be hidden", 3.0f);
 			} else if (hidden.erase(id)) {
@@ -1824,6 +3099,55 @@ public:
 			menuOpen = false;
 			break;
 		}
+	}
+
+	// The letter a game is filed under: A-Z, or # for the rest
+	std::string initialOf(int k) const
+	{
+		const std::string &t = games[view[k]].title;
+		for (unsigned char c : t) {
+			if (std::isalpha(c)) {
+				return std::string(1, (char)std::toupper(c));
+			}
+			if (std::isdigit(c)) {
+				return "#";
+			}
+		}
+		return "#";
+	}
+
+	// R2: the first game of the next letter; L2: the first of this letter, or of the one before
+	void jumpLetter(int dir)
+	{
+		if (view.empty()) {
+			return;
+		}
+		int k = selected;
+		const std::string here = initialOf(k);
+		if (dir > 0) {
+			while (k < (int)view.size() - 1 && initialOf(k) == here) {
+				k++;
+			}
+		} else {
+			int start = k;
+			while (start > 0 && initialOf(start - 1) == here) {
+				start--;
+			}
+			if (start < k) {
+				k = start;
+			} else if (start > 0) {
+				const std::string before = initialOf(start - 1);
+				k = start - 1;
+				while (k > 0 && initialOf(k - 1) == before) {
+					k--;
+				}
+			}
+		}
+		if (k != selected) {
+			move(k - selected);
+		}
+		letterShown = initialOf(selected);
+		letterTimer = 0.9f;
 	}
 
 	// Put the selected game in the category chosen from the list
@@ -1864,6 +3188,7 @@ public:
 		const int next = std::clamp(selected + delta, 0, (int)view.size() - 1);
 		if (next != selected) {
 			selected = next;
+			playSound(0);
 #if defined(VK_EXAMPLE_PS5)
 			pad_vibrate(0.0f, 0.15f);
 			vibrateTimer = 0.04f;
@@ -1873,6 +3198,9 @@ public:
 
 	void handleInput(float dt)
 	{
+		if (closeAfterUpdate > 0.0f) {
+			return; // closing after an update or restore: nothing more to change
+		}
 #if defined(VK_EXAMPLE_PS5)
 		if (ps5.frameBudget) {
 			return; // a test run is the same whoever holds the pad
@@ -1922,13 +3250,28 @@ public:
 			}
 			return;
 		}
+		if (launcherPanel) {
+			if (p.pressed & PAD_CROSS) {
+				ensureLauncher(true);
+				openLauncherPanel();
+				showMessage("Launcher: " + launcherStatus, 3.0f);
+			}
+			if (p.pressed & (PAD_CIRCLE | PAD_OPTIONS)) {
+				launcherPanel = false;
+				circleHeld = -10.0f;
+				playSound(2);
+			}
+			return;
+		}
 		if (settingsOpen) {
 			const int count = (int)settingsItems().size();
 			if (p.pressed & PAD_UP) {
 				settingsIndex = (settingsIndex + count - 1) % count;
+				playSound(0);
 			}
 			if (p.pressed & PAD_DOWN) {
 				settingsIndex = (settingsIndex + 1) % count;
+				playSound(0);
 			}
 			if (p.pressed & PAD_LEFT) {
 				settingsChange(settingsIndex, -1);
@@ -1942,14 +3285,68 @@ public:
 			if ((p.pressed & PAD_CIRCLE) || optionsTap) {
 				settingsOpen = false;
 				circleHeld = -10.0f;
+				playSound(2);
 			}
 			return;
 		}
 		if (optionsTap) {
+			playSound(1);
 			settingsOpen = true;
 			menuOpen = false;
 			settingsIndex = 0;
 			return;
+		}
+		// L3: the grid, or the row
+		if (p.pressed & PAD_L3) {
+			settings.grid = !settings.grid;
+			saveSettings();
+			gridScroll = (float)(selected / gridCols);
+			showMessage(settings.grid ? "Grid view" : "Cover Flow view", 1.5f);
+			playSound(1);
+		}
+		// L2 / R2: jump by letter
+		const bool l2 = p.l2 > 0.6f, r2 = p.r2 > 0.6f;
+		if (r2 && !r2Down) {
+			jumpLetter(1);
+		}
+		if (l2 && !l2Down) {
+			jumpLetter(-1);
+		}
+		l2Down = l2;
+		r2Down = r2;
+		// The right stick scrolls fast
+		if (std::abs(p.right_x) > 0.5f) {
+			stickTimer -= dt;
+			if (stickTimer <= 0.0f) {
+				move(p.right_x > 0 ? 1 : -1);
+				stickTimer = 0.045f;
+			}
+		} else {
+			stickTimer = 0.0f;
+		}
+		// In the grid, UP / DOWN and the stick move a row (not while a menu has them)
+		if (settings.grid && !menuOpen) {
+			int rows = 0;
+			if (p.pressed & PAD_UP) {
+				rows = -1;
+			}
+			if (p.pressed & PAD_DOWN) {
+				rows = 1;
+			}
+			if (std::abs(p.left_y) > 0.6f || std::abs(p.right_y) > 0.6f) {
+				const float y = std::abs(p.left_y) > std::abs(p.right_y) ? p.left_y : p.right_y;
+				stickYTimer -= dt;
+				if (stickYTimer <= 0.0f) {
+					rows = y > 0 ? 1 : -1;
+					stickYTimer = 0.18f;
+				}
+			} else {
+				stickYTimer = 0.0f;
+			}
+			if (rows != 0) {
+				const int target = std::clamp(selected + rows * gridCols, 0, (int)view.size() - 1);
+				move(target - selected);
+			}
 		}
 		// D-pad: a press moves one; held, it repeats after a pause
 		int dir = 0;
@@ -1957,7 +3354,7 @@ public:
 			dir = -1;
 		} else if (p.held & PAD_RIGHT) {
 			dir = 1;
-		} else if (std::abs(p.left_x) > 0.45f) {
+		} else if (std::abs(p.left_x) > 0.45f && (!settings.grid || std::abs(p.left_x) > std::abs(p.left_y))) {
 			dir = p.left_x > 0 ? 1 : -1;
 		}
 		if (p.pressed & (PAD_LEFT | PAD_RIGHT)) {
@@ -1975,10 +3372,10 @@ public:
 			repeatTimer = 0.0f;
 		}
 		if (p.pressed & PAD_L1) {
-			move(-5);
+			move(settings.grid ? -gridCols * 3 : -5);
 		}
 		if (p.pressed & PAD_R1) {
-			move(5);
+			move(settings.grid ? gridCols * 3 : 5);
 		}
 		if (p.pressed & PAD_SQUARE) {
 			sortMode = (sortMode + 1) % sortCount;
@@ -1987,21 +3384,40 @@ public:
 			showMessage(std::string("Sorted by ") + sortNames[sortMode], 2.0f);
 		}
 		if (p.pressed & PAD_TOUCH_PAD) {
-			filterMode = (filterMode + 1) % filterCount;
+			// The next filter, skipping collections nothing is in
+			do {
+				filterMode = (filterMode + 1) % filterCount;
+			} while (filterMode >= baseFilters && !collectionUsed(filterMode - baseFilters));
 			rebuildView();
 			saveSettings();
-			showMessage(std::string("Showing ") + filterNames[filterMode] + " (" + std::to_string(view.size()) + ")", 2.0f);
+			showMessage(std::string("Showing ") + filterName(filterMode) + " (" + std::to_string(view.size()) + ")", 2.0f);
 		}
 		const Game *game = current();
 		if ((p.pressed & PAD_TRIANGLE) && game) {
 			menuOpen = !menuOpen;
 			menuIndex = 0;
 			categoryOpen = false;
+			collectionsOpen = false;
+			playSound(menuOpen ? 1 : 2);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
 		}
-		if (menuOpen && categoryOpen) {
+		if (menuOpen && collectionsOpen) {
+			if (p.pressed & PAD_UP) {
+				collectionIndex = (collectionIndex + collectionCount - 1) % collectionCount;
+			}
+			if (p.pressed & PAD_DOWN) {
+				collectionIndex = (collectionIndex + 1) % collectionCount;
+			}
+			if (p.pressed & PAD_CROSS) {
+				toggleCollection(collectionIndex);
+			}
+			if (p.pressed & PAD_CIRCLE) {
+				collectionsOpen = false;
+				circleHeld = -10.0f;
+			}
+		} else if (menuOpen && categoryOpen) {
 			if (p.pressed & PAD_UP) {
 				categoryIndex = (categoryIndex + 4) % 5;
 			}
@@ -2057,16 +3473,34 @@ public:
 
 		// The backdrop: the theme's picture or the glow
 		const glm::vec4 floorClip = projection * view3d * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
-		const float horizon = 0.5f + 0.5f * floorClip.y / floorClip.w;
-		PushConstants pc{ glm::mat4(0.0f), glm::vec4(theme.accent, horizon) };
+		const float horizon = settings.grid ? 0.93f : 0.5f + 0.5f * floorClip.y / floorClip.w;
+		PushConstants pc{ glm::mat4(0.0f), glm::vec4(theme.accent, horizon), glm::vec4(theme.accent, clock) };
 		pc.mvp[0][0] = theme.hasPicture ? 1.0f : 0.0f;
 		pc.mvp[0][1] = theme.pictureAspect / ((float)width / (float)height);
 		pc.mvp[0][2] = theme.dimming;
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.background);
-		VkDescriptorSet backdropSet = theme.hasPicture ? backgroundSet : games[0].descriptorSet;
+		VkDescriptorSet backdropSet = theme.hasPicture ? backgroundSet : placeholderSet;
 		vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &backdropSet, 0, nullptr);
 		vkCmdPushConstants(cmd, pipelineLayout, stages, 0, sizeof(pc), &pc);
 		vkCmdDraw(cmd, 3, 1, 0, 0);
+		// The selected game's artwork over it, the last one fading out
+		auto artLayer = [&](const std::string &id, float alpha) {
+			Art *a = id.empty() ? nullptr : findArt(id);
+			if (!a || alpha < 0.01f) {
+				return;
+			}
+			PushConstants layer{ glm::mat4(0.0f), glm::vec4(theme.accent, horizon), glm::vec4(theme.accent, clock) };
+			layer.mvp[0][0] = 2.0f;
+			layer.mvp[0][1] = a->aspect / ((float)width / (float)height);
+			layer.mvp[0][2] = 0.5f;
+			layer.mvp[0][3] = alpha * 0.85f;
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.art);
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &a->set, 0, nullptr);
+			vkCmdPushConstants(cmd, pipelineLayout, stages, 0, sizeof(layer), &layer);
+			vkCmdDraw(cmd, 3, 1, 0, 0);
+		};
+		artLayer(artPrev, artPrevAlpha);
+		artLayer(artShown, artAlpha);
 
 		// The visible covers, farthest from the middle first
 		std::vector<int> order;
@@ -2077,28 +3511,84 @@ public:
 		}
 		std::sort(order.begin(), order.end(), [&](int a, int b) { return std::abs(a - position) > std::abs(b - position); });
 		const glm::mat4 viewProjection = projection * view3d;
-		for (int pass = 0; pass < 2; pass++) {
-			const bool reflection = pass == 0;
-			if (reflection && theme.reflection <= 0.0f) {
-				continue;
+		auto draw = [&](const glm::mat4 &model, const glm::vec4 &params, VkDescriptorSet set) {
+			pc.mvp = viewProjection * model;
+			pc.params = params;
+			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &set, 0, nullptr);
+			vkCmdPushConstants(cmd, pipelineLayout, stages, 0, sizeof(pc), &pc);
+			vkCmdDraw(cmd, 6, 1, 0, 0);
+		};
+		// Side covers a little darker, the far ones fading out
+		auto brightnessAt = [](float a) { return 1.0f - 0.40f * std::min(a, 1.0f) - 0.05f * std::max(0.0f, a - 1.0f); };
+		auto alphaAt = [](float a) { return std::clamp(8.5f - a, 0.0f, 1.0f); };
+
+		if (settings.grid) {
+			// The grid: rows of covers facing the screen, the selected one lifted and glowing
+			auto cell = [&](int k, float &alpha, bool &sel) {
+				const int row = k / gridCols, col = k % gridCols;
+				const float d = row - gridScroll;
+				sel = k == selected;
+				alpha = std::clamp(2.3f - std::abs(d), 0.0f, 1.0f);
+				const float size = 0.6f * (sel ? 1.1f : 1.0f);
+				const float x = (col - (gridCols - 1) * 0.5f) * 0.78f, y = 0.28f - d * 0.74f;
+				return glm::scale(glm::translate(glm::mat4(1.0f), glm::vec3(x, y - size * 0.5f, sel ? 0.15f : 0.0f)), glm::vec3(size, size, 1.0f));
+			};
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.reflection);
+			if (selected < (int)view.size()) {
+				float alpha;
+				bool sel;
+				glm::mat4 glow = cell(selected, alpha, sel);
+				glow = glm::scale(glm::translate(glow, glm::vec3(0.0f, -0.12f, -0.02f)), glm::vec3(1.25f, 1.25f, 1.0f));
+				draw(glow, glm::vec4(0.0f, 1.0f, alpha, 3.0f), placeholderSet);
 			}
-			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, reflection ? pipelines.reflection : pipelines.cover);
-			for (int k : order) {
-				const float offset = k - position;
-				const float a = std::abs(offset);
-				glm::mat4 model = coverModel(offset);
-				if (reflection) {
-					model = glm::scale(model, glm::vec3(1.0f, -1.0f, 1.0f));
+			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.cover);
+			for (int k = 0; k < (int)view.size(); k++) {
+				if (std::abs(k / gridCols - gridScroll) > 2.6f) {
+					continue;
 				}
-				// Side covers a little darker, the far ones fading out
-				const float brightness = 1.0f - 0.38f * std::min(a, 1.0f) - 0.05f * std::max(0.0f, a - 1.0f);
-				const float alpha = std::clamp(8.5f - a, 0.0f, 1.0f);
-				pc.mvp = viewProjection * model;
-				pc.params = glm::vec4(reflection ? theme.reflection : 0.0f, brightness, alpha, (k == selected && a < 0.05f) ? 1.0f : 0.0f);
-				vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &games[view[k]].descriptorSet, 0, nullptr);
-				vkCmdPushConstants(cmd, pipelineLayout, stages, 0, sizeof(pc), &pc);
-				vkCmdDraw(cmd, 6, 1, 0, 0);
+				float alpha;
+				bool sel;
+				const glm::mat4 model = cell(k, alpha, sel);
+				draw(model, glm::vec4(0.0f, sel ? 1.0f : 0.78f, alpha, sel ? 1.0f : 0.0f), coverSet(games[view[k]]));
 			}
+			drawUI(cmd);
+			endDynamicRendering(cmd);
+			VK_CHECK_RESULT(vkEndCommandBuffer(cmd));
+			return;
+		}
+
+		// Blended, without depth writes: reflections, shadows on the floor, the glow
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.reflection);
+		if (theme.reflection > 0.0f) {
+			for (int k : order) {
+				const float a = std::abs(k - position);
+				draw(glm::scale(coverModel(k - position), glm::vec3(1.0f, -1.0f, 1.0f)),
+					glm::vec4(theme.reflection, brightnessAt(a), alphaAt(a), 0.0f), coverSet(games[view[k]]));
+			}
+		}
+		for (int k : order) {
+			const float a = std::abs(k - position);
+			glm::mat4 floor = coverModel(k - position);
+			floor = glm::translate(floor, glm::vec3(0.0f, 0.003f, 0.0f));
+			floor = glm::rotate(floor, glm::radians(90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+			floor = glm::scale(floor, glm::vec3(1.25f, 0.7f, 1.0f));
+			floor = glm::translate(floor, glm::vec3(0.0f, -0.5f, 0.0f));
+			draw(floor, glm::vec4(0.0f, 1.0f, alphaAt(a), 2.0f), placeholderSet);
+		}
+		if (!view.empty()) {
+			// The glow follows the row as it settles on the selection
+			const float settle = std::clamp(1.0f - std::abs(selected - position) * 1.5f, 0.0f, 1.0f);
+			glm::mat4 glow = coverModel(selected - position);
+			glow = glm::translate(glow, glm::vec3(0.0f, -0.12f, -0.02f));
+			glow = glm::scale(glow, glm::vec3(1.25f, 1.25f, 1.0f));
+			draw(glow, glm::vec4(0.0f, 1.0f, settle, 3.0f), placeholderSet);
+		}
+		// The covers, farthest from the middle first, writing depth
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.cover);
+		for (int k : order) {
+			const float a = std::abs(k - position);
+			draw(coverModel(k - position), glm::vec4(0.0f, brightnessAt(a), alphaAt(a), (k == selected && a < 0.05f) ? 1.0f : 0.0f),
+				coverSet(games[view[k]]));
 		}
 
 		drawUI(cmd);
@@ -2113,8 +3603,25 @@ public:
 		}
 		VulkanExampleBase::prepareFrame();
 		const float dt = std::min(frameTimer, 0.1f);
+		clock += dt;
+		introTime += dt;
+		uploadCovers();
+		updateArt(dt);
+		auto ease = [dt](float &v, bool on) { v += ((on ? 1.0f : 0.0f) - v) * (1.0f - std::exp(-dt * 16.0f)); };
+		ease(menuAnim, menuOpen);
+		ease(settingsAnim, settingsOpen);
+		ease(dialogAnim, updateDialog);
+		ease(loadingAnim, coversLoaded < (int)games.size());
 		handleInput(dt);
-		// The row slides towards the selection, quickly at first, then settles
+		// The row slides towards the selection, quickly at first, then settles;
+		// the grid scrolls to the selection's row
+		if (settings.grid) {
+			gridScroll += ((float)(selected / gridCols) - gridScroll) * (1.0f - std::exp(-dt * 10.0f));
+			position = (float)selected;
+		}
+		if (letterTimer > 0.0f) {
+			letterTimer -= dt;
+		}
 		position += (selected - position) * (1.0f - std::exp(-dt * 11.0f));
 		if (std::abs(selected - position) < 0.001f) {
 			position = (float)selected;
@@ -2122,8 +3629,12 @@ public:
 		if (messageTimer > 0.0f) {
 			messageTimer -= dt;
 		}
+		if (closeAfterUpdate > 0.0f && (closeAfterUpdate -= dt) <= 0.0f) {
+			quit = true;
+		}
 		collectSizes();
 		pollUpdates(dt);
+		pollTools();
 		if (menuOpen && current()) {
 			requestSize(*current());
 		}
@@ -2164,146 +3675,467 @@ public:
 		return s;
 	}
 
-	// The text: drawn straight onto the screen with ImGui's font
+	// ---------------------------------------------------------------- the interface
+
+	enum Glyph { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_OPTIONS, G_SHARE, G_TOUCHPAD, G_L1, G_R1, G_DPAD_LR, G_DPAD_UD, G_L2, G_R2, G_L3, G_RSTICK };
+
+	// Everything on screen but the covers, drawn with ImGui's draw list
 	void OnUpdateUIOverlay(vks::UIOverlay *overlay) override
 	{
 		ImDrawList *dl = ImGui::GetOverlayDrawList();
 		ImFont *font = ImGui::GetFont();
 		const float s = height / 1080.0f;
-		auto withAlpha = [](ImU32 c, int a) { return (c & 0x00FFFFFFu) | ((ImU32)std::clamp(a, 0, 255) << 24); };
-		auto text = [&](const std::string &str, float size, float y, ImU32 colour, float alignX = 0.5f, float x = -1.0f) {
-			const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, str.c_str());
-			const float px = (x < 0.0f ? width * 0.5f : x) - extent.x * alignX;
-			dl->AddText(font, size, ImVec2(px + 2.0f * s, y + 2.0f * s), withAlpha(IM_COL32(0, 0, 0, 255), ((colour >> 24) & 0xFF) * 160 / 255), str.c_str());
+		const float W = (float)width, H = (float)height;
+		auto alphaOf = [](ImU32 c) { return (int)((c >> 24) & 0xFF); };
+		auto withAlpha = [&](ImU32 c, float a) { return (c & 0x00FFFFFFu) | ((ImU32)std::clamp((int)(a * alphaOf(c)), 0, 255) << 24); };
+		const ImU32 white = IM_COL32(255, 255, 255, 255);
+		const ImU32 textC = theme.text, dimC = theme.dim;
+		const ImU32 accentC = IM_COL32((int)(theme.accent.r * 255), (int)(theme.accent.g * 255), (int)(theme.accent.b * 255), 255);
+		auto width_ = [&](const std::string &str, float size) { return font->CalcTextSizeA(size, FLT_MAX, 0.0f, str.c_str()).x; };
+		auto text = [&](const std::string &str, float size, float x, float y, ImU32 colour, float alignX = 0.0f, bool shadow = true) {
+			const float px = x - width_(str, size) * alignX;
+			if (shadow) {
+				dl->AddText(font, size, ImVec2(px + 1.5f * s, y + 2.0f * s), IM_COL32(0, 0, 0, alphaOf(colour) * 140 / 255), str.c_str());
+			}
 			dl->AddText(font, size, ImVec2(px, y), colour, str.c_str());
 		};
-		text(theme.heading, 44.0f * s, 46.0f * s, theme.text, 0.0f, 70.0f * s);
-		text(std::string(filterNames[filterMode]) + "  -  " + sortNames[sortMode], 24.0f * s, 104.0f * s, theme.dim, 0.0f, 72.0f * s);
+		// A string cut to a width, with an ellipsis
+		auto fit = [&](std::string str, float size, float maxW) {
+			if (width_(str, size) <= maxW) {
+				return str;
+			}
+			while (!str.empty() && width_(str + "...", size) > maxW) {
+				str.pop_back();
+				while (!str.empty() && ((unsigned char)str.back() & 0xC0) == 0x80) {
+					str.pop_back(); // whole UTF-8 characters only
+				}
+			}
+			return str + "...";
+		};
+		auto panel = [&](float x, float y, float w, float h, float a) {
+			for (int i = 3; i >= 1; i--) {
+				const float g = i * 10.0f * s;
+				dl->AddRectFilled(ImVec2(x - g, y - g + 8.0f * s), ImVec2(x + w + g, y + h + g + 8.0f * s), IM_COL32(0, 0, 0, (int)(28 * a)), 22.0f * s + g);
+			}
+			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(16, 18, 26, (int)(246 * a)), 20.0f * s);
+			dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(255, 255, 255, (int)(26 * a)), 20.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+		};
+		// PlayStation button symbols, white in a soft disc, as the console's own menus draw them
+		auto glyph = [&](Glyph g, float cx, float cy, float r, float a) -> float {
+			const ImU32 fg = IM_COL32(255, 255, 255, (int)(235 * a)), bg = IM_COL32(255, 255, 255, (int)(34 * a));
+			const float t = std::max(1.5f, 0.16f * r);
+			switch (g) {
+			case G_CROSS:
+			case G_CIRCLE:
+			case G_TRIANGLE:
+			case G_SQUARE: {
+				dl->AddCircleFilled(ImVec2(cx, cy), r, bg, 32);
+				const float k = r * 0.48f;
+				if (g == G_CROSS) {
+					dl->AddLine(ImVec2(cx - k, cy - k), ImVec2(cx + k, cy + k), fg, t);
+					dl->AddLine(ImVec2(cx - k, cy + k), ImVec2(cx + k, cy - k), fg, t);
+				} else if (g == G_CIRCLE) {
+					dl->AddCircle(ImVec2(cx, cy), k * 1.05f, fg, 28, t);
+				} else if (g == G_TRIANGLE) {
+					dl->AddTriangle(ImVec2(cx, cy - k * 1.05f), ImVec2(cx + k * 1.1f, cy + k * 0.8f), ImVec2(cx - k * 1.1f, cy + k * 0.8f), fg, t);
+				} else {
+					dl->AddRect(ImVec2(cx - k * 0.9f, cy - k * 0.9f), ImVec2(cx + k * 0.9f, cy + k * 0.9f), fg, 0.0f, ImDrawCornerFlags_All, t);
+				}
+				return 2.0f * r;
+			}
+			case G_OPTIONS:
+			case G_SHARE: {
+				const float w = r * 1.3f;
+				dl->AddRectFilled(ImVec2(cx - w, cy - r * 0.8f), ImVec2(cx + w, cy + r * 0.8f), bg, r * 0.8f);
+				for (int i = -1; i <= 1; i++) {
+					if (g == G_OPTIONS) {
+						dl->AddLine(ImVec2(cx - w * 0.45f, cy + i * r * 0.32f), ImVec2(cx + w * 0.45f, cy + i * r * 0.32f), fg, t * 0.8f);
+					} else {
+						dl->AddLine(ImVec2(cx + i * r * 0.36f - r * 0.12f, cy + r * 0.38f), ImVec2(cx + i * r * 0.36f + r * 0.12f, cy - r * 0.38f), fg, t * 0.8f);
+					}
+				}
+				return 2.0f * w;
+			}
+			case G_TOUCHPAD: {
+				const float w = r * 1.6f;
+				dl->AddRectFilled(ImVec2(cx - w, cy - r * 0.75f), ImVec2(cx + w, cy + r * 0.75f), bg, r * 0.3f);
+				dl->AddRect(ImVec2(cx - w * 0.62f, cy - r * 0.38f), ImVec2(cx + w * 0.62f, cy + r * 0.38f), fg, r * 0.15f, ImDrawCornerFlags_All, t * 0.8f);
+				return 2.0f * w;
+			}
+			case G_L1:
+			case G_R1:
+			case G_L2:
+			case G_R2:
+			case G_L3:
+			case G_RSTICK: {
+				const char *label = g == G_L1 ? "L1" : g == G_R1 ? "R1" : g == G_L2 ? "L2" : g == G_R2 ? "R2" : g == G_L3 ? "L3" : "R";
+				const float size = r * 1.05f, w = width_(label, size) * 0.5f + r * 0.55f;
+				dl->AddRectFilled(ImVec2(cx - w, cy - r * 0.8f), ImVec2(cx + w, cy + r * 0.8f), bg, r * 0.35f);
+				text(label, size, cx, cy - size * 0.52f, fg, 0.5f, false);
+				return 2.0f * w;
+			}
+			case G_DPAD_LR:
+			case G_DPAD_UD: {
+				dl->AddCircleFilled(ImVec2(cx, cy), r, bg, 32);
+				const float k = r * 0.5f, n = r * 0.2f;
+				const bool lr = g == G_DPAD_LR;
+				const ImU32 on = fg, off = IM_COL32(255, 255, 255, (int)(70 * a));
+				dl->AddRectFilled(ImVec2(cx - k, cy - n), ImVec2(cx + k, cy + n), lr ? on : off, n * 0.5f);
+				dl->AddRectFilled(ImVec2(cx - n, cy - k), ImVec2(cx + n, cy + k), lr ? off : on, n * 0.5f);
+				return 2.0f * r;
+			}
+			}
+			return 0.0f;
+		};
+		// A row of hints: symbols and their words, centred on x
+		auto hints = [&](const std::vector<std::pair<std::vector<Glyph>, std::string>> &items, float cx, float y, float a) {
+			const float r = 15.0f * s, size = 22.0f * s, gap = 34.0f * s, inner = 9.0f * s;
+			auto glyphW = [&](Glyph g) {
+				switch (g) {
+				case G_OPTIONS:
+				case G_SHARE: return 2.6f * r;
+				case G_TOUCHPAD: return 3.2f * r;
+				case G_L1:
+				case G_R1:
+				case G_L2:
+				case G_R2:
+				case G_L3:
+				case G_RSTICK: return width_("L1", r * 1.05f) + 1.1f * r;
+				default: return 2.0f * r;
+				}
+			};
+			float total = 0.0f;
+			for (const auto &[gs, label] : items) {
+				for (Glyph g : gs) {
+					total += glyphW(g) + 4.0f * s;
+				}
+				total += inner + width_(label, size) + gap;
+			}
+			float x = cx - (total - gap) * 0.5f;
+			for (const auto &[gs, label] : items) {
+				for (Glyph g : gs) {
+					const float w = glyphW(g);
+					glyph(g, x + w * 0.5f, y, r, a);
+					x += w + 4.0f * s;
+				}
+				x += inner;
+				text(label, size, x, y - size * 0.55f, withAlpha(dimC, a * 0.95f), 0.0f, false);
+				x += width_(label, size) + gap;
+			}
+		};
+		auto chip = [&](const std::string &label, float x, float y, float size, ImU32 fill, ImU32 colour) {
+			const float padX = size * 0.6f, h = size * 1.55f, w = width_(label, size) + padX * 2.0f;
+			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), fill, h * 0.5f);
+			text(label, size, x + padX, y + (h - size) * 0.48f, colour, 0.0f, false);
+			return w;
+		};
+		auto star = [&](float cx, float cy, float r, ImU32 colour) {
+			ImVec2 outer[5], inner[5];
+			for (int i = 0; i < 5; i++) {
+				const float ao = -1.5708f + i * 1.2566f, ai = ao + 0.6283f;
+				outer[i] = ImVec2(cx + std::cos(ao) * r, cy + std::sin(ao) * r);
+				inner[i] = ImVec2(cx + std::cos(ai) * r * 0.42f, cy + std::sin(ai) * r * 0.42f);
+			}
+			dl->AddConvexPolyFilled(inner, 5, colour);
+			for (int i = 0; i < 5; i++) {
+				dl->AddTriangleFilled(outer[i], inner[i], inner[(i + 4) % 5], colour);
+			}
+		};
+
+		// ---- the header: heading, filter and sort; count and where the library came from
+		const float margin = 72.0f * s;
+		text(theme.heading, 46.0f * s, margin, 44.0f * s, textC);
+		float cx = margin;
+		const float chipY = 108.0f * s, chipSize = 20.0f * s;
+		cx += chip(filterName(filterMode), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
+		chip(sortNames[sortMode], cx, chipY, chipSize, IM_COL32(255, 255, 255, 30), textC);
+		// Right: the clock and the position; below, where the library came from and the free space
+		{
+			const std::string clockStr = clockText();
+			text(clockStr, 34.0f * s, W - margin, 46.0f * s, textC, 1.0f);
+			if (!view.empty()) {
+				const std::string count = std::to_string(selected + 1) + " / " + std::to_string(view.size());
+				text(count, 24.0f * s, W - margin - width_(clockStr, 34.0f * s) - 28.0f * s, 54.0f * s, dimC, 1.0f, false);
+			}
+			const bool live = listSource == "live";
+			std::string source = live ? "Live library" : listSource.rfind("saved", 0) == 0 ? "Saved library" :
+				listSource == "games.txt" ? "From games.txt" : listSource == "demonstration covers" ? "Demo covers" : "Library";
+			if (!storageText.empty()) {
+				source += "   \xC2\xB7   " + storageText;
+			}
+			const float sx = W - margin - width_(source, 20.0f * s);
+			dl->AddCircleFilled(ImVec2(sx - 14.0f * s, 111.0f * s), 5.0f * s, live ? IM_COL32(80, 220, 130, 255) : IM_COL32(240, 180, 60, 255), 16);
+			text(source, 20.0f * s, W - margin, 99.0f * s, dimC, 1.0f, false);
+		}
+		// ---- loading progress, while covers arrive
+		if (loadingAnim > 0.01f && !games.empty()) {
+			const float a = loadingAnim, w = 360.0f * s, x = (W - w) * 0.5f, y = 60.0f * s;
+			const std::string label = "Loading covers  " + std::to_string(coversLoaded) + " / " + std::to_string(games.size());
+			text(label, 20.0f * s, W * 0.5f, y - 30.0f * s, withAlpha(dimC, a), 0.5f, false);
+			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + 5.0f * s), IM_COL32(255, 255, 255, (int)(30 * a)), 3.0f * s);
+			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w * coversLoaded / std::max<size_t>(1, games.size()), y + 5.0f * s),
+				withAlpha(accentC, a), 3.0f * s);
+		}
+
+		// ---- the selected game's name, category and favourite mark
 		if (!view.empty()) {
-			text(std::to_string(selected + 1) + " / " + std::to_string(view.size()), 30.0f * s, 56.0f * s, theme.dim, 1.0f, width - 70.0f * s);
-			text(listSource, 20.0f * s, 100.0f * s, withAlpha(theme.dim, 150), 1.0f, width - 70.0f * s);
 			const Game &game = *current();
-			// The title fades in as the row settles on it
-			const int fade = (int)(255.0f * std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f));
-			text(game.title, 52.0f * s, height * 0.785f, withAlpha(theme.text, fade));
-			std::string sub = !game.subtitle.empty() ? game.subtitle : game.titleId;
-			if (isFavourite(game)) {
-				sub += sub.empty() ? "Favourite" : "  -  Favourite";
+			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f);
+			const float titleSize = 54.0f * s, ty = H * 0.775f;
+			text(fit(game.title, titleSize, W * 0.8f), titleSize, W * 0.5f, ty, withAlpha(textC, fade), 0.5f);
+			std::string meta = game.subtitle.empty() ? categoryName(game.section) : game.subtitle;
+			if (game.section == "Other" && game.subtitle.empty()) {
+				meta = game.titleId;
 			}
-			if (!sub.empty()) {
-				text(sub, 28.0f * s, height * 0.785f + 64.0f * s, withAlpha(theme.dim, fade));
+			const bool fav = isFavourite(game);
+			const float metaSize = 24.0f * s, my = ty + 72.0f * s;
+			const float metaW = width_(meta, metaSize) + (fav ? 34.0f * s : 0.0f);
+			float mx = W * 0.5f - metaW * 0.5f;
+			if (fav) {
+				star(mx + 11.0f * s, my + metaSize * 0.5f, 11.0f * s, withAlpha(IM_COL32(255, 200, 70, 255), fade));
+				mx += 34.0f * s;
 			}
-			if (menuOpen) {
-				// The game menu: details on the left, actions on the right
-				const float w = 1040.0f * s, h = 470.0f * s;
-				const float x0 = (width - w) * 0.5f, y0 = height * 0.24f;
-				dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), IM_COL32(8, 10, 16, 228), 14.0f * s);
-				dl->AddRect(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), withAlpha(theme.dim, 90), 14.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-				float y = y0 + 26.0f * s;
-				const float lx = x0 + 30.0f * s, vx = x0 + 200.0f * s;
-				std::string name = game.title;
-				if (name.size() > 30) {
-					name = name.substr(0, 29) + "...";
+			text(meta, metaSize, mx, my, withAlpha(dimC, fade));
+		} else {
+			text(std::string("No ") + filterName(filterMode), 34.0f * s, W * 0.5f, H * 0.42f, textC, 0.5f);
+			text("Press the touchpad to show another category", 24.0f * s, W * 0.5f, H * 0.42f + 54.0f * s, dimC, 0.5f);
+		}
+
+		// ---- the letter a jump landed on
+		if (letterTimer > 0.0f && !letterShown.empty()) {
+			const float a = std::clamp(letterTimer * 3.0f, 0.0f, 1.0f);
+			const float size = 150.0f * s, box = 220.0f * s;
+			const float cx2 = W * 0.5f, cy2 = H * 0.42f;
+			dl->AddRectFilled(ImVec2(cx2 - box * 0.5f, cy2 - box * 0.5f), ImVec2(cx2 + box * 0.5f, cy2 + box * 0.5f), IM_COL32(10, 12, 18, (int)(200 * a)), 28.0f * s);
+			dl->AddRect(ImVec2(cx2 - box * 0.5f, cy2 - box * 0.5f), ImVec2(cx2 + box * 0.5f, cy2 + box * 0.5f), withAlpha(accentC, a), 28.0f * s, ImDrawCornerFlags_All, 3.0f * s);
+			text(letterShown, size, cx2, cy2 - size * 0.56f, withAlpha(white, a), 0.5f, false);
+		}
+
+		// ---- behind a panel, the row dims
+		{
+			const float dim = std::max(std::max(std::max(menuAnim, settingsAnim), dialogAnim), launcherPanel ? 1.0f : 0.0f);
+			if (dim > 0.01f) {
+				dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, (int)(110 * dim)));
+			}
+		}
+
+		// ---- the game menu
+		if (menuAnim > 0.01f && current()) {
+			const Game &game = *current();
+			const float a = menuAnim, w = 1160.0f * s, h = 610.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = H * 0.16f + (1.0f - a) * 24.0f * s;
+			panel(x0, y0, w, h, a);
+			const float pad = 40.0f * s;
+			text(fit(game.title, 34.0f * s, w * 0.5f - pad), 34.0f * s, x0 + pad, y0 + 30.0f * s, withAlpha(textC, a));
+			chip(categoryName(game.section) + (sectionOverride.count(game.titleId) ? "" : "  (auto)"), x0 + pad, y0 + 84.0f * s, 18.0f * s,
+				withAlpha(accentC, 0.8f * a), withAlpha(white, a));
+			// Details
+			float y = y0 + 146.0f * s;
+			const float labelX = x0 + pad, valueX = x0 + pad + 170.0f * s;
+			auto row = [&](const char *label, const std::string &value) {
+				text(label, 23.0f * s, labelX, y, withAlpha(dimC, a), 0.0f, false);
+				text(fit(value, 23.0f * s, w * 0.5f - 210.0f * s), 23.0f * s, valueX, y, withAlpha(textC, a), 0.0f, false);
+				y += 44.0f * s;
+			};
+			row("Title ID", game.titleId.empty() ? "None" : game.titleId);
+			row("Platform", game.platform.empty() ? "Other" : game.platform);
+			row("Size", game.bytes == 0 && (listSource != "live" || game.titleId.empty()) ? "Unknown" : formatSize(game.bytes));
+			row("Installed", formatDate(game.installed));
+			{
+				auto pt = playTime.find(game.titleId);
+				row("Played", pt == playTime.end() ? "Not yet" : formatDuration(pt->second.seconds) + (pt->second.count > 1 ? "  (" + std::to_string(pt->second.count) + " times)" : ""));
+				row("Last played", pt == playTime.end() ? "-" : formatDate(pt->second.last));
+			}
+			row("Cover", game.coverFrom);
+			// Actions
+			const std::vector<std::string> items = menuItems(game);
+			const float bx = x0 + w * 0.52f, bw = w * 0.48f - pad, bh = 62.0f * s;
+			float by = y0 + 34.0f * s;
+			for (int i = 0; i < (int)items.size(); i++) {
+				const bool on = i == menuIndex && !categoryOpen && !collectionsOpen;
+				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(16 * a)), 12.0f * s);
+				text(fit(items[i], 25.0f * s, bw - 44.0f * s), 25.0f * s, bx + 24.0f * s, by + 17.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
+				by += bh + 12.0f * s;
+			}
+			hints({ { { G_DPAD_UD }, "Choose" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } }, x0 + w * 0.5f, y0 + h - 34.0f * s, a);
+			if (collectionsOpen) {
+				const float cw = bw, ch = 80.0f * s + collectionCount * 64.0f * s;
+				const float cx2 = bx, cy = y0 + 24.0f * s;
+				dl->AddRectFilled(ImVec2(cx2 - 8.0f * s, cy - 8.0f * s), ImVec2(cx2 + cw + 8.0f * s, cy + ch + 8.0f * s), IM_COL32(10, 11, 16, (int)(255 * a)), 16.0f * s);
+				dl->AddRect(ImVec2(cx2 - 8.0f * s, cy - 8.0f * s), ImVec2(cx2 + cw + 8.0f * s, cy + ch + 8.0f * s), IM_COL32(255, 255, 255, (int)(40 * a)), 16.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+				text("Collections  (CROSS adds or removes)", 22.0f * s, cx2 + 20.0f * s, cy + 16.0f * s, withAlpha(dimC, a), 0.0f, false);
+				for (int i = 0; i < collectionCount; i++) {
+					const float ry = cy + 66.0f * s + i * 64.0f * s;
+					const bool on = i == collectionIndex;
+					if (on) {
+						dl->AddRectFilled(ImVec2(cx2, ry), ImVec2(cx2 + cw, ry + 54.0f * s), withAlpha(accentC, a), 10.0f * s);
+					}
+					// A box, ticked when the game is in it
+					const float bx2 = cx2 + 22.0f * s, by2 = ry + 15.0f * s, bs = 24.0f * s;
+					dl->AddRect(ImVec2(bx2, by2), ImVec2(bx2 + bs, by2 + bs), withAlpha(white, a), 5.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+					if (inCollection(game, i)) {
+						dl->AddLine(ImVec2(bx2 + 5.0f * s, by2 + 12.0f * s), ImVec2(bx2 + 10.0f * s, by2 + 18.0f * s), withAlpha(white, a), 3.0f * s);
+						dl->AddLine(ImVec2(bx2 + 10.0f * s, by2 + 18.0f * s), ImVec2(bx2 + 20.0f * s, by2 + 6.0f * s), withAlpha(white, a), 3.0f * s);
+					}
+					text(collectionNames[i], 24.0f * s, cx2 + 64.0f * s, ry + 14.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
 				}
-				text(name, 32.0f * s, y, theme.text, 0.0f, lx);
-				y += 60.0f * s;
-				auto row = [&](const char *label, const std::string &value) {
-					text(label, 24.0f * s, y, theme.dim, 0.0f, lx);
-					text(value, 24.0f * s, y, theme.text, 0.0f, vx);
-					y += 40.0f * s;
-				};
-				row("Title ID", game.titleId.empty() ? "none" : game.titleId);
-				row("Platform", game.platform.empty() ? "other" : game.platform);
-				row("Category", categoryName(game.section) + (sectionOverride.count(game.titleId) ? "" : " (auto)"));
-				row("Size", game.bytes == 0 && (listSource != "live" || game.titleId.empty()) ? "unknown" : formatSize(game.bytes));
-				row("Installed", formatDate(game.installed));
-				row("Cover", game.coverFrom);
-				// The actions
-				const std::vector<std::string> items = menuItems(game);
-				const float bx = x0 + w * 0.55f, bw = w * 0.45f - 30.0f * s, bh = 58.0f * s;
-				float by = y0 + 30.0f * s;
-				for (int i = 0; i < (int)items.size(); i++) {
-					const bool on = i == menuIndex;
-					const ImU32 accent = IM_COL32((int)(theme.accent.r * 255), (int)(theme.accent.g * 255), (int)(theme.accent.b * 255), on ? 235 : 0);
-					dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), on ? accent : IM_COL32(255, 255, 255, 18), 8.0f * s);
-					text(items[i], 26.0f * s, by + 14.0f * s, on ? IM_COL32(255, 255, 255, 255) : theme.text, 0.0f, bx + 22.0f * s);
-					by += bh + 14.0f * s;
-				}
-				text("UP / DOWN  choose      CROSS  select      CIRCLE  close", 22.0f * s, y0 + h - 44.0f * s, withAlpha(theme.dim, 200), 0.0f, lx);
-				if (categoryOpen) {
-					// The category list, over the actions
-					const float cw = w * 0.45f, ch = 70.0f * s + 5 * 62.0f * s;
-					const float cx = x0 + w * 0.55f - 20.0f * s, cy = y0 + 20.0f * s;
-					dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + cw, cy + ch), IM_COL32(14, 16, 24, 255), 12.0f * s);
-					dl->AddRect(ImVec2(cx, cy), ImVec2(cx + cw, cy + ch), withAlpha(theme.dim, 120), 12.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-					text("Choose a category", 24.0f * s, cy + 18.0f * s, theme.dim, 0.0f, cx + 24.0f * s);
-					auto ov = sectionOverride.find(game.titleId);
-					const std::string automatic = autoSection(game.titleId, game.title, game.contentId);
-					for (int i = 0; i < 5; i++) {
-						const float ry = cy + 62.0f * s + i * 62.0f * s;
-						const bool on = i == categoryIndex;
-						const bool current = i == 0 ? ov == sectionOverride.end() : (ov != sectionOverride.end() && ov->second == categoryKeys[i]);
-						if (on) {
-							dl->AddRectFilled(ImVec2(cx + 12.0f * s, ry), ImVec2(cx + cw - 12.0f * s, ry + 52.0f * s),
-								IM_COL32((int)(theme.accent.r * 255), (int)(theme.accent.g * 255), (int)(theme.accent.b * 255), 235), 8.0f * s);
-						}
-						const std::string label = i == 0 ? "Automatic  (" + categoryName(automatic) + ")" : categoryName(categoryKeys[i]);
-						text((current ? "> " : "   ") + label, 25.0f * s, ry + 12.0f * s, on ? IM_COL32(255, 255, 255, 255) : theme.text, 0.0f, cx + 24.0f * s);
+			}
+			if (categoryOpen) {
+				const float cw = bw, ch = 80.0f * s + 5 * 64.0f * s;
+				const float cx2 = bx, cy = y0 + 24.0f * s;
+				dl->AddRectFilled(ImVec2(cx2 - 8.0f * s, cy - 8.0f * s), ImVec2(cx2 + cw + 8.0f * s, cy + ch + 8.0f * s), IM_COL32(10, 11, 16, (int)(255 * a)), 16.0f * s);
+				dl->AddRect(ImVec2(cx2 - 8.0f * s, cy - 8.0f * s), ImVec2(cx2 + cw + 8.0f * s, cy + ch + 8.0f * s), IM_COL32(255, 255, 255, (int)(40 * a)), 16.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+				text("Category", 22.0f * s, cx2 + 20.0f * s, cy + 16.0f * s, withAlpha(dimC, a), 0.0f, false);
+				auto ov = sectionOverride.find(game.titleId);
+				const std::string automatic = autoSection(game.titleId, game.title, game.contentId);
+				for (int i = 0; i < 5; i++) {
+					const float ry = cy + 66.0f * s + i * 64.0f * s;
+					const bool on = i == categoryIndex;
+					const bool chosen = i == 0 ? ov == sectionOverride.end() : (ov != sectionOverride.end() && ov->second == categoryKeys[i]);
+					if (on) {
+						dl->AddRectFilled(ImVec2(cx2, ry), ImVec2(cx2 + cw, ry + 54.0f * s), withAlpha(accentC, a), 10.0f * s);
+					}
+					const std::string label = i == 0 ? "Automatic  (" + categoryName(automatic) + ")" : categoryName(categoryKeys[i]);
+					text(label, 24.0f * s, cx2 + 24.0f * s, ry + 14.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
+					if (chosen) {
+						// A tick
+						const float tx = cx2 + cw - 36.0f * s, tyy = ry + 27.0f * s;
+						dl->AddLine(ImVec2(tx - 9.0f * s, tyy), ImVec2(tx - 2.0f * s, tyy + 8.0f * s), withAlpha(white, a), 3.0f * s);
+						dl->AddLine(ImVec2(tx - 2.0f * s, tyy + 8.0f * s), ImVec2(tx + 12.0f * s, tyy - 9.0f * s), withAlpha(white, a), 3.0f * s);
 					}
 				}
 			}
-		} else {
-			text(std::string("No ") + filterNames[filterMode] + " - press TOUCHPAD to change the filter", 30.0f * s, height * 0.45f, theme.dim);
 		}
-		if (messageTimer > 0.0f) {
-			const int a = (int)(255.0f * std::clamp(messageTimer, 0.0f, 1.0f));
-			text(message, 28.0f * s, height * 0.9f, IM_COL32(120, 170, 255, a));
-		}
-		auto panel = [&](float x0, float y0, float w, float h) {
-			dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), IM_COL32(8, 10, 16, 250), 14.0f * s);
-			dl->AddRect(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), withAlpha(theme.dim, 90), 14.0f * s, ImDrawCornerFlags_All, 2.0f * s);
-		};
-		const ImU32 accentFill = IM_COL32((int)(theme.accent.r * 255), (int)(theme.accent.g * 255), (int)(theme.accent.b * 255), 235);
-		if (settingsOpen) {
-			const std::vector<std::string> items = settingsItems();
-			const float w = 1180.0f * s, rowH = 56.0f * s, h = 130.0f * s + rowH * items.size();
-			const float x0 = (width - w) * 0.5f, y0 = (height - h) * 0.5f;
-			panel(x0, y0, w, h);
-			text(std::string("Settings  -  Cover Flow ") + coverFlowVersion, 32.0f * s, y0 + 24.0f * s, theme.text, 0.0f, x0 + 30.0f * s);
+
+		// ---- settings
+		if (settingsAnim > 0.01f) {
+			const auto items = settingsItems();
+			const float a = settingsAnim, rowH = 46.0f * s, w = 1240.0f * s;
+			static const std::map<int, const char *> groups = { { S_RETURN, "Library" }, { S_THEME, "Look and sound" }, { S_UPDATE_CHECK, "Updates" }, { S_LAUNCHER, "Cover Flow" } };
+			const float h = 130.0f * s + rowH * items.size() + 32.0f * s * groups.size();
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
+			panel(x0, y0, w, h, a);
+			const float pad = 40.0f * s;
+			text("Settings", 34.0f * s, x0 + pad, y0 + 28.0f * s, withAlpha(textC, a));
+			text(std::string("Cover Flow ") + coverFlowVersion, 22.0f * s, x0 + w - pad, y0 + 38.0f * s, withAlpha(dimC, a), 1.0f, false);
 			float y = y0 + 80.0f * s;
 			for (int i = 0; i < (int)items.size(); i++) {
+				auto group = groups.find(i);
+				if (group != groups.end()) {
+					text(group->second, 18.0f * s, x0 + pad, y + 7.0f * s, withAlpha(accentC, a), 0.0f, false);
+					y += 32.0f * s;
+				}
 				const bool on = i == settingsIndex;
 				if (on) {
-					dl->AddRectFilled(ImVec2(x0 + 18.0f * s, y - 6.0f * s), ImVec2(x0 + w - 18.0f * s, y + rowH - 14.0f * s), accentFill, 8.0f * s);
+					dl->AddRectFilled(ImVec2(x0 + 22.0f * s, y), ImVec2(x0 + w - 22.0f * s, y + rowH - 6.0f * s), withAlpha(accentC, a), 10.0f * s);
 				}
-				std::string line = items[i];
-				if (line.size() > 92) {
-					line = line.substr(0, 91) + "...";
+				const ImU32 c = withAlpha(on ? white : textC, a);
+				text(items[i].first, 23.0f * s, x0 + pad, y + 8.0f * s, c, 0.0f, false);
+				if (!items[i].second.empty()) {
+					std::string value = fit(items[i].second, 23.0f * s, w * 0.45f);
+					float vx = x0 + w - pad;
+					if (on && settingAdjustable(i)) {
+						// < value > when LEFT / RIGHT change it
+						text(">", 23.0f * s, vx, y + 8.0f * s, c, 1.0f, false);
+						vx -= 30.0f * s;
+						text(value, 23.0f * s, vx, y + 8.0f * s, c, 1.0f, false);
+						text("<", 23.0f * s, vx - width_(value, 23.0f * s) - 14.0f * s, y + 8.0f * s, c, 1.0f, false);
+					} else {
+						text(value, 23.0f * s, vx, y + 8.0f * s, on ? c : withAlpha(dimC, a), 1.0f, false);
+					}
 				}
-				text(line, 24.0f * s, y + 4.0f * s, on ? IM_COL32(255, 255, 255, 255) : theme.text, 0.0f, x0 + 34.0f * s);
 				y += rowH;
 			}
-			text("UP / DOWN  choose      LEFT / RIGHT  change      CROSS  select      CIRCLE  close", 22.0f * s, y0 + h - 42.0f * s,
-				withAlpha(theme.dim, 200), 0.0f, x0 + 30.0f * s);
+			hints({ { { G_DPAD_UD }, "Choose" }, { { G_DPAD_LR }, "Change" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Close" } },
+				x0 + w * 0.5f, y0 + h - 32.0f * s, a);
 		}
-		if (updateDialog) {
-			const float w = 760.0f * s, h = 250.0f * s;
-			const float x0 = (width - w) * 0.5f, y0 = (height - h) * 0.5f;
-			panel(x0, y0, w, h);
-			text("UPDATE AVAILABLE", 34.0f * s, y0 + 26.0f * s, theme.text);
-			text(std::string(coverFlowVersion) + "  ->  " + updateTag + "   (" + settings.updateRepo + ")", 24.0f * s, y0 + 84.0f * s, theme.dim);
+
+		// ---- the update dialog
+		if (dialogAnim > 0.01f) {
+			std::vector<std::string> notes;
+			{
+				std::stringstream ns(updateNotes);
+				std::string line;
+				while (std::getline(ns, line) && notes.size() < 9) {
+					line = trim(line);
+					while (!line.empty() && (line[0] == '#' || line[0] == '*')) {
+						line = trim(line.substr(1));
+					}
+					if (!line.empty()) {
+						notes.push_back(line);
+					}
+				}
+			}
+			const float a = dialogAnim, w = 900.0f * s, h = 300.0f * s + notes.size() * 34.0f * s + (notes.empty() ? 0.0f : 20.0f * s);
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
+			panel(x0, y0, w, h, a);
+			text("Update available", 34.0f * s, W * 0.5f, y0 + 34.0f * s, withAlpha(textC, a), 0.5f);
+			text(std::string("Cover Flow ") + coverFlowVersion + "   ->   " + updateTag, 24.0f * s, W * 0.5f, y0 + 92.0f * s, withAlpha(dimC, a), 0.5f, false);
+			for (size_t i = 0; i < notes.size(); i++) {
+				text(fit(notes[i], 22.0f * s, w - 120.0f * s), 22.0f * s, x0 + 60.0f * s, y0 + 146.0f * s + i * 34.0f * s, withAlpha(textC, a), 0.0f, false);
+			}
 			const char *choices[2] = { "Update now", "Later" };
 			for (int i = 0; i < 2; i++) {
-				const float bw = 250.0f * s, bh = 60.0f * s;
-				const float bx = width * 0.5f + (i == 0 ? -bw - 20.0f * s : 20.0f * s), by = y0 + h - bh - 30.0f * s;
-				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), i == updateChoice ? accentFill : IM_COL32(255, 255, 255, 22), 8.0f * s);
-				text(choices[i], 26.0f * s, by + 15.0f * s, IM_COL32(255, 255, 255, 255), 0.5f, bx + bw * 0.5f);
+				const float bw = 280.0f * s, bh = 64.0f * s;
+				const float bx = W * 0.5f + (i == 0 ? -bw - 14.0f * s : 14.0f * s), by = y0 + h - bh - 70.0f * s;
+				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), i == updateChoice ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(22 * a)), 14.0f * s);
+				text(choices[i], 26.0f * s, bx + bw * 0.5f, by + 17.0f * s, withAlpha(white, a), 0.5f, false);
 			}
+			hints({ { { G_DPAD_LR }, "Choose" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Later" } }, W * 0.5f, y0 + h - 30.0f * s, a);
 		}
-		const char *quitHints[4] = { "OPTIONS + SHARE  quit", "L1 + R1 + OPTIONS  quit", "hold CIRCLE  quit", "" };
-		text(std::string("LEFT / RIGHT  browse    L1 / R1  jump    CROSS  start    TRIANGLE  menu    SQUARE  sort    TOUCHPAD  filter    OPTIONS  settings") +
-				(settings.quitWith < 3 ? std::string("    ") + quitHints[settings.quitWith] : std::string()),
-			20.0f * s, height - 52.0f * s, withAlpha(theme.dim, 190));
+
+		// ---- the launcher panel: its state and the end of its log
+		if (launcherPanel) {
+			const float w = 1300.0f * s, h = 720.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
+			panel(x0, y0, w, h, 1.0f);
+			const float pad = 40.0f * s;
+			text("Launcher", 34.0f * s, x0 + pad, y0 + 28.0f * s, textC);
+			text(launcherStatus, 22.0f * s, x0 + w - pad, y0 + 38.0f * s, dimC, 1.0f, false);
+			dl->AddRectFilled(ImVec2(x0 + pad, y0 + 90.0f * s), ImVec2(x0 + w - pad, y0 + h - 90.0f * s), IM_COL32(0, 0, 0, 120), 12.0f * s);
+			const float lineH = 28.0f * s;
+			const int fits = (int)((h - 200.0f * s) / lineH);
+			const int first = std::max(0, (int)logLines.size() - fits);
+			float ly = y0 + 104.0f * s;
+			for (int i = first; i < (int)logLines.size(); i++) {
+				text(fit(logLines[i], 19.0f * s, w - pad * 2.0f - 40.0f * s), 19.0f * s, x0 + pad + 20.0f * s, ly, dimC, 0.0f, false);
+				ly += lineH;
+			}
+			hints({ { { G_CROSS }, "Reload the launcher" }, { { G_CIRCLE }, "Close" } }, W * 0.5f, y0 + h - 44.0f * s, 1.0f);
+		}
+
+		// ---- the toast: messages slide in above the hints
+		if (messageTimer > 0.0f && !message.empty()) {
+			const float a = std::clamp(messageTimer * 3.0f, 0.0f, 1.0f) * std::clamp((introTime > 0.0f ? 1.0f : 0.0f), 0.0f, 1.0f);
+			const float size = 24.0f * s;
+			const std::string m = fit(message, size, W * 0.7f);
+			const float w = width_(m, size) + 64.0f * s, h = 58.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = 150.0f * s - (1.0f - a) * 16.0f * s;
+			dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + w, y0 + h), IM_COL32(20, 22, 32, (int)(240 * a)), h * 0.5f);
+			dl->AddRectFilled(ImVec2(x0, y0), ImVec2(x0 + 8.0f * s, y0 + h), withAlpha(accentC, a), 4.0f * s, ImDrawCornerFlags_Left);
+			text(m, size, x0 + 34.0f * s, y0 + (h - size) * 0.45f, withAlpha(textC, a), 0.0f, false);
+		}
+
+		// ---- the hints along the bottom
+		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && !launcherPanel) {
+			std::vector<std::pair<std::vector<Glyph>, std::string>> items = {
+				{ { G_DPAD_LR }, "Browse" }, { { G_L2, G_R2 }, "Letter" }, { { G_CROSS }, "Start" }, { { G_TRIANGLE }, "Menu" },
+				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
+			};
+			if (settings.quitWith == 0) {
+				items.push_back({ { G_OPTIONS, G_SHARE }, "Quit" });
+			} else if (settings.quitWith == 1) {
+				items.push_back({ { G_L1, G_R1, G_OPTIONS }, "Quit" });
+			} else if (settings.quitWith == 2) {
+				items.push_back({ { G_CIRCLE }, "Hold to quit" });
+			}
+			hints(items, W * 0.5f, H - 58.0f * s, 1.0f);
+		}
+
+		// ---- the fade in from black when Cover Flow opens
+		if (introTime < 0.7f) {
+			dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, (int)(255 * (1.0f - introTime / 0.7f))));
+		}
 	}
 };
 
@@ -2319,24 +4151,28 @@ bool ps5OverlayFont(std::string &path, float &size)
 	if (root.size() >= suffix.size() && root.compare(root.size() - suffix.size(), suffix.size(), suffix) == 0) {
 		root.resize(root.size() - suffix.size());
 	}
-	std::ifstream ini(root + "theme/theme.ini");
-	std::string line;
-	while (ini && std::getline(ini, line)) {
-		const size_t eq = line.find('=');
-		if (eq == std::string::npos) {
-			continue;
-		}
-		auto trimmed = [](std::string v) {
-			const size_t a = v.find_first_not_of(" \t\r\n");
-			const size_t b = v.find_last_not_of(" \t\r\n");
-			return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
-		};
-		if (trimmed(line.substr(0, eq)) == "font") {
-			const std::string file = root + "theme/" + trimmed(line.substr(eq + 1));
-			if (std::ifstream(file).good()) {
-				path = file;
+	auto trimmed = [](std::string v) {
+		const size_t a = v.find_first_not_of(" \t\r\n");
+		const size_t b = v.find_last_not_of(" \t\r\n");
+		return a == std::string::npos ? std::string() : v.substr(a, b - a + 1);
+	};
+	auto value = [&](const std::string &file, const std::string &key) {
+		std::ifstream ini(file);
+		std::string line;
+		while (ini && std::getline(ini, line)) {
+			const size_t eq = line.find('=');
+			if (eq != std::string::npos && trimmed(line.substr(0, eq)) == key) {
+				return trimmed(line.substr(eq + 1));
 			}
 		}
+		return std::string();
+	};
+	// The chosen theme's folder: themes/<name>/, or theme/ for "Custom" (and older settings)
+	std::string name = value(root + "coverflow.ini", "theme_name");
+	std::string folder = name.empty() || name == "Custom" ? root + "theme/" : root + "themes/" + name + "/";
+	const std::string font = value(folder + "theme.ini", "font");
+	if (!font.empty() && std::ifstream(folder + font).good()) {
+		path = folder + font;
 	}
 	size = 36.0f;
 	return true;

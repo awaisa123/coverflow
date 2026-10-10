@@ -11,18 +11,28 @@
  *                        again once <TO> has closed and the console is idle
  *   update-check <owner/repo>
  *                        the latest GitHub release of that repository:
- *                        "ok <tag>" when it has eboot.bin, cflaunch.elf and
- *                        SHA256SUMS, or "err ..."
+ *                        "ok <tag>" when it has SHA256SUMS and eboot.bin, or "err ..."
  *   update-apply <owner/repo> <TITLEID>
- *                        download those three files, check both against
- *                        SHA256SUMS, and only then put them in
- *                        /data/homebrew/<TITLEID>/: "ok <tag>" or "err ..."
+ *                        download every file SHA256SUMS lists (a path in the
+ *                        title folder; its release asset is named with "__"
+ *                        for each "/"), check each against SHA256SUMS, and
+ *                        only when all match put them in /data/homebrew/<TITLEID>/:
+ *                        "ok <tag> <files>" or "err ..."
  *   list                 the installed titles, read from the console's app
  *                        metadata (which Cover Flow's sandbox cannot see):
  *                        "ok list", then
  *                        "ID<TAB>0<TAB>MTIME<TAB>NAME<TAB>KIND<TAB>CONTENTID"
  *                        a title (KIND: where it is served from, game or
  *                        homebrew), then "end"; sizes come from "size"
+ *   art <ID>             "ok <bytes>" and the title's background art (pic1/pic0 PNG
+ *                        or JPG from its metadata), or "err ..."
+ *   playtime             "ok playtime", "ID<TAB>SECONDS<TAB>LAST<TAB>COUNT" a title
+ *                        started from Cover Flow, then "end"
+ *   storage              "ok <free bytes> <total bytes>" of the console's storage
+ *   backup <TITLEID>     copy Cover Flow's settings, games.txt and the play times
+ *                        to <USB>/CoverFlowBackup/: "ok <folder> <files>"
+ *   restore <TITLEID>    copy them back from the first USB drive that has them
+ *   log                  "ok log", the last lines of this launcher's log, "end"
  *   size <ID>            "ok <bytes>": the largest of the title's install
  *                        places, measured through links and mounts
  *   where <ID>           the places a title has, their sizes and first entries
@@ -70,6 +80,9 @@
 
 #include <arpa/inet.h>
 #include <poll.h>
+#include <netdb.h>
+#include <sys/mount.h>
+#include <time.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -837,17 +850,94 @@ static void send_icon(int client, const char *id)
 
 // ----------------------------------------------------------------- returning
 
-// The game Cover Flow started, and Cover Flow, to start again once it closes
+// ----------------------------------------------------------------- play time
+
+#define PLAYTIME_FILE "/data/cflaunch-playtime.txt"
+#define PLAYTIME_MAX 512
+
+typedef struct play_record
+{
+    char id[16];
+    long long seconds, last, count;
+} play_record_t;
+
+static int load_play(play_record_t *records)
+{
+    FILE *const file = fopen(PLAYTIME_FILE, "r");
+    int n = 0;
+    if (file == NULL)
+        return 0;
+    while (n < PLAYTIME_MAX &&
+           fscanf(file, "%15s %lld %lld %lld", records[n].id, &records[n].seconds, &records[n].last, &records[n].count) == 4)
+        n++;
+    fclose(file);
+    return n;
+}
+
+// Add one session to a title's record
+static void record_play(const char *id, long long seconds, long long ended)
+{
+    static play_record_t records[PLAYTIME_MAX];
+    int n = load_play(records), at = -1;
+    for (int i = 0; i < n && at < 0; i++)
+        if (strcmp(records[i].id, id) == 0)
+            at = i;
+    if (at < 0)
+    {
+        if (n >= PLAYTIME_MAX)
+            return;
+        at = n++;
+        memset(&records[at], 0, sizeof(records[at]));
+        snprintf(records[at].id, sizeof(records[at].id), "%s", id);
+    }
+    records[at].seconds += seconds > 0 ? seconds : 0;
+    records[at].last = ended;
+    records[at].count++;
+    FILE *const file = fopen(PLAYTIME_FILE ".new", "w");
+    if (file == NULL)
+        return;
+    for (int i = 0; i < n; i++)
+        fprintf(file, "%s %lld %lld %lld\n", records[i].id, records[i].seconds, records[i].last, records[i].count);
+    fclose(file);
+    rename(PLAYTIME_FILE ".new", PLAYTIME_FILE);
+    log_line("cflaunch: %s played %lld s (total %lld s)", id, seconds, records[at].seconds);
+}
+
+static void send_playtime(int client)
+{
+    static play_record_t records[PLAYTIME_MAX];
+    const int n = load_play(records);
+    send_all(client, "ok playtime\n", 12);
+    for (int i = 0; i < n; i++)
+    {
+        char line[96];
+        const int len = snprintf(line, sizeof(line), "%s\t%lld\t%lld\t%lld\n", records[i].id, records[i].seconds, records[i].last,
+                                 records[i].count);
+        send_all(client, line, (size_t)len);
+    }
+    send_all(client, "end\n", 4);
+}
+
+// ----------------------------------------------------------------- watching a game
+
+// The game Cover Flow started (timed while it runs), and Cover Flow, to start
+// again once it closes when asked to
 static char g_watch_game[16];
 static char g_watch_home[16];
+static int g_watch_return;
 static int g_watch_idle;
+static long long g_watch_started;
+static int g_watch_closed;
 
-static void watch_start(const char *game, const char *home)
+static void watch_start(const char *game, const char *home, int come_back)
 {
     snprintf(g_watch_game, sizeof(g_watch_game), "%s", game);
     snprintf(g_watch_home, sizeof(g_watch_home), "%s", home);
+    g_watch_return = come_back;
     g_watch_idle = 0;
-    log_line("cflaunch: will bring %s back when %s closes", home, game);
+    g_watch_closed = 0;
+    g_watch_started = (long long)time(NULL);
+    log_line("cflaunch: timing %s%s%s", game, come_back ? "; will bring back " : "", come_back ? home : "");
 }
 
 // Called about once a second while nothing else is asked
@@ -857,15 +947,29 @@ static void watch_tick(void)
         return;
     char running[32] = {0};
     const uint32_t app = running_app(running, sizeof(running));
+    const int game_running = app != PS5VKCTL_NO_APP && strncmp(running, g_watch_game, PS5VKCTL_TITLE) == 0;
+    if (!g_watch_closed && !game_running)
+    {
+        // The session is over: count it
+        const long long now = (long long)time(NULL);
+        record_play(g_watch_game, now - g_watch_started, now);
+        g_watch_closed = 1;
+    }
+    if (game_running)
+    {
+        g_watch_idle = 0;
+        return;
+    }
     if (app != PS5VKCTL_NO_APP)
     {
-        if (strncmp(running, g_watch_game, PS5VKCTL_TITLE) != 0)
-        {
-            // Something else was started from the home screen: stand aside
-            log_line("cflaunch: %s is running now; not bringing %s back", running, g_watch_home);
-            g_watch_game[0] = '\0';
-        }
-        g_watch_idle = 0;
+        // Something else was started from the home screen: stand aside
+        log_line("cflaunch: %s is running now; not bringing %s back", running, g_watch_home);
+        g_watch_game[0] = '\0';
+        return;
+    }
+    if (!g_watch_return)
+    {
+        g_watch_game[0] = '\0';
         return;
     }
     // The game has closed: after two idle seconds, start Cover Flow again
@@ -877,6 +981,134 @@ static void watch_tick(void)
     const int started = start_title(g_watch_home, &name, &code, detail, sizeof(detail));
     log_line("cflaunch: %s closed; starting %s: %s %s", g_watch_game, g_watch_home, started == 0 ? "ok" : "failed", detail);
     g_watch_game[0] = '\0';
+}
+
+// ----------------------------------------------------------------- artwork, storage, backup, log
+
+static void send_art(int client, const char *id)
+{
+    if (id == NULL || !is_title_id(id))
+    {
+        reply(client, "err usage: art <TITLEID>");
+        return;
+    }
+    static const char *const names[] = {"pic1.png", "pic0.png", "pic1.jpg", "pic0.jpg", "pic2.png"};
+    for (size_t r = 0; r < sizeof(meta_roots) / sizeof(meta_roots[0]); r++)
+        for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++)
+        {
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s/%s", meta_roots[r], id, names[n]);
+            size_t size = 0;
+            char *const data = read_file(path, 24 << 20, &size);
+            if (data == NULL)
+                continue;
+            char head[32];
+            const int len = snprintf(head, sizeof(head), "ok %zu\n", size);
+            if (send_all(client, head, (size_t)len) == 0)
+                send_all(client, data, size);
+            free(data);
+            return;
+        }
+    reply(client, "err no art for %s", id);
+}
+
+static void send_storage(int client)
+{
+    struct statfs fs;
+    if (statfs("/user", &fs) != 0)
+    {
+        reply(client, "err statfs: %s", strerror(errno));
+        return;
+    }
+    reply(client, "ok %lld %lld", (long long)fs.f_bavail * (long long)fs.f_bsize, (long long)fs.f_blocks * (long long)fs.f_bsize);
+}
+
+static void make_parents(const char *file);
+
+static int copy_file(const char *from, const char *to)
+{
+    size_t size = 0;
+    char *const data = read_file(from, 16 << 20, &size);
+    if (data == NULL)
+        return -1;
+    make_parents(to);
+    FILE *const file = fopen(to, "wb");
+    const int ok = file != NULL && fwrite(data, 1, size, file) == size;
+    if (file != NULL)
+        fclose(file);
+    free(data);
+    return ok ? 0 : -1;
+}
+
+// The files a backup holds: in the title folder, or absolute
+static void backup_paths(const char *title, char from[3][192], const char *names[3])
+{
+    names[0] = "coverflow.ini";
+    names[1] = "games.txt";
+    names[2] = "playtime.txt";
+    snprintf(from[0], 192, "/data/homebrew/%s/coverflow.ini", title);
+    snprintf(from[1], 192, "/data/homebrew/%s/covers/games.txt", title);
+    snprintf(from[2], 192, "%s", PLAYTIME_FILE);
+}
+
+static void backup_or_restore(int client, const char *title, int restore)
+{
+    if (!valid_title(title))
+    {
+        reply(client, "err usage: %s <TITLEID>", restore ? "restore" : "backup");
+        return;
+    }
+    char from[3][192];
+    const char *names[3];
+    backup_paths(title, from, names);
+    for (int u = 0; u < 8; u++)
+    {
+        char drive[32], folder[64];
+        snprintf(drive, sizeof(drive), "/mnt/usb%d", u);
+        if (!is_folder(drive))
+            continue;
+        snprintf(folder, sizeof(folder), "%s/CoverFlowBackup", drive);
+        if (restore && !is_folder(folder))
+            continue;
+        int done = 0;
+        for (int i = 0; i < 3; i++)
+        {
+            char other[256];
+            snprintf(other, sizeof(other), "%s/%s", folder, names[i]);
+            if (restore ? copy_file(other, from[i]) == 0 : copy_file(from[i], other) == 0)
+                done++;
+        }
+        log_line("cflaunch: %s %s: %d files", restore ? "restored from" : "backed up to", folder, done);
+        if (done == 0 && !restore)
+        {
+            reply(client, "err could not write to %s", folder);
+            return;
+        }
+        reply(client, "ok %s %d", folder, done);
+        return;
+    }
+    reply(client, restore ? "err no USB drive with a CoverFlowBackup folder" : "err no USB drive found");
+}
+
+static void send_log(int client)
+{
+    size_t size = 0;
+    char *const data = read_file(PS5VKCTL_LOG, 4 << 20, &size);
+    send_all(client, "ok log\n", 7);
+    if (data != NULL)
+    {
+        // The last 40 lines
+        size_t at = size;
+        int lines = 0;
+        while (at > 0 && lines <= 40)
+            if (data[--at] == '\n')
+                lines++;
+        if (lines > 40)
+            at++;
+        send_all(client, data + at, size - at);
+        free(data);
+    }
+    send_all(client, "end\n", 4);
 }
 
 // ----------------------------------------------------------------- SHA-256
@@ -992,7 +1224,23 @@ int sceHttp2SendRequest(int, const void *, size_t);
 int sceHttp2GetStatusCode(int, int *);
 int sceHttp2ReadData(int, void *, size_t);
 
+int sceHttpInit(int, int, size_t);
+int sceHttpCreateTemplate(int, const char *, int, int);
+int sceHttpCreateConnectionWithURL(int, const char *, int);
+int sceHttpCreateRequestWithURL(int, int, const char *, uint64_t);
+int sceHttpSendRequest(int, const void *, size_t);
+int sceHttpGetStatusCode(int, int *);
+int sceHttpReadData(int, void *, size_t);
+int sceHttpDeleteRequest(int);
+int sceHttpDeleteConnection(int);
+
 static int g_http_template = -1;
+static int g_http1_template = -1;
+static int g_use_http1; // HTTP/2 failed here once: go straight to HTTP/1.1
+// Why the last request failed: 1 the name did not resolve, 2 it resolved to a
+// blocked address (a DNS filter), 3 the connection or its certificate; and the code
+static int g_http_error;
+static uint32_t g_http_code;
 
 static int http_ready(void)
 {
@@ -1009,17 +1257,142 @@ static int http_ready(void)
     if (http < 0 && net >= 0 && ssl >= 0)
         http = sceHttp2Init(net, ssl, 512 * 1024, 2);
     if (http >= 0)
-        g_http_template = sceHttp2CreateTemplate(http, "CoverFlow-cflaunch/5", 3, 1);
-    log_line("cflaunch: https net=%d ssl=%d http=%d template=%d", net, ssl, http, g_http_template);
-    return g_http_template >= 0 ? 0 : -1;
+        g_http_template = sceHttp2CreateTemplate(http, "CoverFlow-cflaunch/7", 3, 1);
+    // The HTTP/1.1 library too, for when HTTP/2 will not connect from here
+    static int http1 = -1;
+    if (http1 < 0 && net >= 0 && ssl >= 0)
+        http1 = sceHttpInit(net, ssl, 512 * 1024);
+    if (http1 >= 0 && g_http1_template < 0)
+        g_http1_template = sceHttpCreateTemplate(http1, "CoverFlow-cflaunch/7", 2, 1);
+    log_line("cflaunch: https net=%d ssl=%d http2=%d template=%d http1=%d template=%d", net, ssl, http, g_http_template, http1,
+             g_http1_template);
+    return g_http_template >= 0 || g_http1_template >= 0 ? 0 : -1;
 }
 
-// GET a URL: the body into a malloc'd buffer (when 'out'), or into a file
-// (when 'file'), hashing it as it goes. Returns the HTTP status, -1 on failure.
+// The body of a request, read with either library, into a buffer and/or a file
+typedef int (*read_fn)(int, void *, size_t);
+static int read_body(read_fn reader, int request, char **out, size_t *size, size_t limit, FILE *file, sha256_t *hash)
+{
+    size_t used = 0, capacity = 0;
+    char *body = NULL;
+    int status = 0;
+    char buffer[16384];
+    int got;
+    while ((got = reader(request, buffer, sizeof(buffer))) > 0)
+    {
+        if (used + (size_t)got > limit)
+        {
+            status = -2;
+            break;
+        }
+        if (hash != NULL)
+            sha256_update(hash, buffer, (size_t)got);
+        if (file != NULL && fwrite(buffer, 1, (size_t)got, file) != (size_t)got)
+        {
+            status = -3;
+            break;
+        }
+        if (out != NULL)
+        {
+            if (used + (size_t)got + 1 > capacity)
+            {
+                capacity = (used + (size_t)got + 1) * 2;
+                char *const grown = realloc(body, capacity);
+                if (grown == NULL)
+                {
+                    status = -4;
+                    break;
+                }
+                body = grown;
+            }
+            memcpy(body + used, buffer, (size_t)got);
+            body[used + (size_t)got] = '\0';
+        }
+        used += (size_t)got;
+    }
+    if (out != NULL)
+        *out = body;
+    else
+        free(body);
+    if (size != NULL)
+        *size = used;
+    return status;
+}
+
+// GET with the HTTP/1.1 library (it follows redirects itself)
+static int http1_get(const char *url, char **out, size_t *size, size_t limit, FILE *file, sha256_t *hash)
+{
+    if (g_http1_template < 0)
+        return -1;
+    const int connection = sceHttpCreateConnectionWithURL(g_http1_template, url, 1);
+    if (connection < 0)
+    {
+        log_line("cflaunch: http1 connection for %s: 0x%08x", url, (uint32_t)connection);
+        g_http_code = (uint32_t)connection;
+        return -1;
+    }
+    const int request = sceHttpCreateRequestWithURL(connection, 0, url, 0);
+    int status = -1;
+    if (request < 0)
+    {
+        log_line("cflaunch: http1 request for %s: 0x%08x", url, (uint32_t)request);
+        g_http_code = (uint32_t)request;
+    }
+    else
+    {
+        const int sent = sceHttpSendRequest(request, NULL, 0);
+        if (sent != 0 || sceHttpGetStatusCode(request, &status) != 0)
+        {
+            log_line("cflaunch: http1 GET %s failed: send 0x%08x", url, (uint32_t)sent);
+            g_http_code = (uint32_t)sent;
+            g_http_error = 3;
+            status = -1;
+        }
+        else if (status == 200)
+        {
+            const int body = read_body(sceHttpReadData, request, out, size, limit, file, hash);
+            if (body < 0)
+                status = body;
+        }
+        sceHttpDeleteRequest(request);
+    }
+    sceHttpDeleteConnection(connection);
+    log_line("cflaunch: http1 GET %s -> %d", url, status);
+    return status;
+}
+
+static int http2_get(const char *url, char **out, size_t *size, size_t limit, FILE *file, sha256_t *hash);
+
+// GET a URL with HTTP/2, falling back to HTTP/1.1 (and staying on it) when
+// HTTP/2 cannot connect from this process
 static int http_get(const char *url, char **out, size_t *size, size_t limit, FILE *file, sha256_t *hash)
 {
     if (http_ready() != 0)
         return -1;
+    if (!g_use_http1 && g_http_template >= 0)
+    {
+        const long start = file != NULL ? ftell(file) : 0;
+        const int status = http2_get(url, out, size, limit, file, hash);
+        if (status != -1)
+            return status;
+        // Nothing was read when sending failed: try again with HTTP/1.1
+        if (file != NULL)
+            fseek(file, start, SEEK_SET);
+        log_line("cflaunch: HTTP/2 failed (0x%08x); trying HTTP/1.1", g_http_code);
+    }
+    const int status = http1_get(url, out, size, limit, file, hash);
+    if (status >= 0 && !g_use_http1)
+    {
+        g_use_http1 = 1;
+        log_line("cflaunch: using HTTP/1.1 from now on");
+    }
+    return status;
+}
+
+// GET a URL: the body into a malloc'd buffer (when 'out'), or into a file
+// (when 'file'), hashing it as it goes. Returns the HTTP status, -1 on failure.
+static int http2_get(const char *url, char **out, size_t *size, size_t limit, FILE *file, sha256_t *hash)
+{
     const int request = sceHttp2CreateRequestWithURL(g_http_template, "GET", url, 0);
     if (request < 0)
     {
@@ -1027,10 +1400,35 @@ static int http_get(const char *url, char **out, size_t *size, size_t limit, FIL
         return -1;
     }
     int status = -1;
-    if (sceHttp2SendRequest(request, NULL, 0) != 0 || sceHttp2GetStatusCode(request, &status) != 0)
+    const int sent = sceHttp2SendRequest(request, NULL, 0);
+    const int got_status = sent == 0 ? sceHttp2GetStatusCode(request, &status) : -1;
+    if (sent != 0 || got_status != 0)
     {
         sceHttp2DeleteRequest(request);
-        log_line("cflaunch: GET %s failed to send", url);
+        // Which step failed: the name lookup, or the connection and its certificate
+        char host[128] = {0};
+        const char *const h = strstr(url, "://");
+        if (h != NULL)
+        {
+            snprintf(host, sizeof(host), "%s", h + 3);
+            char *const slash = strchr(host, '/');
+            if (slash != NULL)
+                *slash = '\0';
+        }
+        struct addrinfo hints, *found = NULL;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        const int lookup = host[0] != '\0' ? getaddrinfo(host, "443", &hints, &found) : -1;
+        char address[64] = "none";
+        if (lookup == 0 && found != NULL)
+            inet_ntop(AF_INET, &((struct sockaddr_in *)found->ai_addr)->sin_addr, address, sizeof(address));
+        if (found != NULL)
+            freeaddrinfo(found);
+        log_line("cflaunch: GET %s failed: send 0x%08x, status 0x%08x; %s resolves to %s (lookup %d)", url, (uint32_t)sent,
+                 (uint32_t)got_status, host, address, lookup);
+        g_http_error = lookup != 0 ? 1 : (strcmp(address, "0.0.0.0") == 0 || strncmp(address, "127.", 4) == 0) ? 2 : 3;
+        g_http_code = (uint32_t)sent;
         return -1;
     }
     size_t used = 0, capacity = 0;
@@ -1094,18 +1492,23 @@ static int valid_repo(const char *repo)
     return 1;
 }
 
-// The latest release: its tag and the download addresses of the three files
-static int latest_release(const char *repo, char *tag, size_t tag_size, char urls[3][512], char *error, size_t error_size)
+// The latest release: its tag, and the release JSON for finding assets
+static int latest_release(const char *repo, char *tag, size_t tag_size, char **json_out, char *error, size_t error_size)
 {
-    static const char *const names[3] = {"eboot.bin", "cflaunch.elf", "SHA256SUMS"};
     char url[256];
     snprintf(url, sizeof(url), "https://api.github.com/repos/%s/releases/latest", repo);
     char *json = NULL;
-    size_t size = 0;
-    const int status = http_get(url, &json, &size, 1 << 20, NULL, NULL);
+    const int status = http_get(url, &json, NULL, 2 << 20, NULL, NULL);
     if (status != 200 || json == NULL)
     {
-        snprintf(error, error_size, "GitHub answered %d for %s", status, repo);
+        if (status == -1 && g_http_error == 1)
+            snprintf(error, error_size, "the PS5 could not look up api.github.com (DNS)");
+        else if (status == -1 && g_http_error == 2)
+            snprintf(error, error_size, "api.github.com is blocked by a DNS filter on this PS5 (nanodns?)");
+        else if (status == -1)
+            snprintf(error, error_size, "could not connect to GitHub securely (0x%08x)", g_http_code);
+        else
+            snprintf(error, error_size, "GitHub answered %d for %s", status, repo);
         free(json);
         return -1;
     }
@@ -1115,60 +1518,56 @@ static int latest_release(const char *repo, char *tag, size_t tag_size, char url
         free(json);
         return -1;
     }
-    int found = 0;
-    for (int i = 0; i < 3; i++)
-    {
-        urls[i][0] = '\0';
-        // Every "browser_download_url": take the one ending in /<name>
-        const char *at = json;
-        while ((at = strstr(at, "\"browser_download_url\"")) != NULL)
-        {
-            char value[512];
-            if (json_string(at, "browser_download_url", value, sizeof(value)) == 0)
-            {
-                const size_t vl = strlen(value), nl = strlen(names[i]);
-                if (vl > nl && value[vl - nl - 1] == '/' && strcmp(value + vl - nl, names[i]) == 0)
-                {
-                    snprintf(urls[i], 512, "%s", value);
-                    found++;
-                    break;
-                }
-            }
-            at += 22;
-        }
-    }
-    free(json);
-    if (found != 3)
-    {
-        snprintf(error, error_size, "release %s lacks eboot.bin, cflaunch.elf or SHA256SUMS", tag);
-        return -1;
-    }
+    *json_out = json;
     return 0;
 }
 
-// The hash SHA256SUMS gives a file name, or ""
-static void expected_hash(const char *sums, const char *name, char out[65])
+// The download address of the release asset with this name, or -1
+static int asset_url(const char *json, const char *name, char *out, size_t size)
 {
-    out[0] = '\0';
-    const char *line = sums;
-    while (line != NULL && *line != '\0')
+    const char *at = json;
+    const size_t nl = strlen(name);
+    while ((at = strstr(at, "\"browser_download_url\"")) != NULL)
     {
-        char hex[65] = {0}, file[256] = {0};
-        if (sscanf(line, "%64s %255s", hex, file) == 2)
+        char value[600];
+        if (json_string(at, "browser_download_url", value, sizeof(value)) == 0)
         {
-            const char *f = file[0] == '*' ? file + 1 : file;
-            if (strcmp(f, name) == 0 && strlen(hex) == 64)
+            const size_t vl = strlen(value);
+            if (vl > nl && value[vl - nl - 1] == '/' && strcmp(value + vl - nl, name) == 0)
             {
-                for (int i = 0; i < 64; i++)
-                    out[i] = (char)(hex[i] >= 'A' && hex[i] <= 'F' ? hex[i] + 32 : hex[i]);
-                out[64] = '\0';
-                return;
+                snprintf(out, size, "%s", value);
+                return 0;
             }
         }
-        line = strchr(line, '\n');
-        if (line != NULL)
-            line++;
+        at += 22;
     }
+    return -1;
+}
+
+// A path a release may write in the title folder: relative, no "..", plain characters
+static int safe_path(const char *path)
+{
+    if (path[0] == '\0' || path[0] == '/' || strlen(path) > 160 || strstr(path, "..") != NULL)
+        return 0;
+    for (const char *c = path; *c != '\0'; c++)
+        if (!(*c == '/' || *c == '-' || *c == '_' || *c == '.' || (*c >= '0' && *c <= '9') ||
+              (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z')))
+            return 0;
+    return 1;
+}
+
+// The folders above a file, made as needed
+static void make_parents(const char *file)
+{
+    char path[256];
+    snprintf(path, sizeof(path), "%s", file);
+    for (char *c = path + 1; *c != '\0'; c++)
+        if (*c == '/')
+        {
+            *c = '\0';
+            mkdir(path, 0777);
+            *c = '/';
+        }
 }
 
 static void update_check(int client, const char *repo)
@@ -1178,16 +1577,21 @@ static void update_check(int client, const char *repo)
         reply(client, "err usage: update-check <owner/repo>");
         return;
     }
-    char tag[64], urls[3][512], error[200];
-    if (latest_release(repo, tag, sizeof(tag), urls, error, sizeof(error)) != 0)
+    char tag[64], error[200], url[600];
+    char *json = NULL;
+    if (latest_release(repo, tag, sizeof(tag), &json, error, sizeof(error)) != 0)
         reply(client, "err %s", error);
+    else if (asset_url(json, "SHA256SUMS", url, sizeof(url)) != 0 || asset_url(json, "eboot.bin", url, sizeof(url)) != 0)
+        reply(client, "err release %s lacks SHA256SUMS or eboot.bin", tag);
     else
         reply(client, "ok %s", tag);
+    free(json);
 }
+
+#define UPDATE_MAX_FILES 64
 
 static void update_apply(int client, const char *repo, const char *title)
 {
-    static const char *const names[2] = {"eboot.bin", "cflaunch.elf"};
     if (!valid_repo(repo) || !valid_title(title))
     {
         reply(client, "err usage: update-apply <owner/repo> <TITLEID>");
@@ -1200,67 +1604,113 @@ static void update_apply(int client, const char *repo, const char *title)
         reply(client, "err %s is not installed in /data/homebrew", title);
         return;
     }
-    char tag[64], urls[3][512], error[200];
-    if (latest_release(repo, tag, sizeof(tag), urls, error, sizeof(error)) != 0)
+    char tag[64], error[200], url[600];
+    char *json = NULL;
+    if (latest_release(repo, tag, sizeof(tag), &json, error, sizeof(error)) != 0)
     {
         reply(client, "err %s", error);
         return;
     }
     char *sums = NULL;
-    if (http_get(urls[2], &sums, NULL, 64 * 1024, NULL, NULL) != 200 || sums == NULL)
+    if (asset_url(json, "SHA256SUMS", url, sizeof(url)) != 0 ||
+        http_get(url, &sums, NULL, 64 * 1024, NULL, NULL) != 200 || sums == NULL)
     {
+        free(json);
         free(sums);
         reply(client, "err could not download SHA256SUMS");
         return;
     }
-    // Both files to .new beside the real ones, each checked against SHA256SUMS
-    char temp[2][192], final_path[2][192];
-    for (int i = 0; i < 2; i++)
+    // The files SHA256SUMS lists
+    static char paths[UPDATE_MAX_FILES][168], hashes[UPDATE_MAX_FILES][65];
+    int count = 0, has_eboot = 0;
+    for (const char *line = sums; line != NULL && *line != '\0' && count < UPDATE_MAX_FILES;)
     {
-        char want[65];
-        expected_hash(sums, names[i], want);
-        snprintf(temp[i], sizeof(temp[i]), "%s/%s.new", folder, names[i]);
-        snprintf(final_path[i], sizeof(final_path[i]), "%s/%s", folder, names[i]);
-        if (want[0] == '\0')
+        char hex[65] = {0}, file[200] = {0};
+        if (sscanf(line, "%64s %199s", hex, file) == 2 && strlen(hex) == 64)
         {
-            free(sums);
-            reply(client, "err SHA256SUMS has no line for %s", names[i]);
-            return;
+            const char *f = file[0] == '*' ? file + 1 : file;
+            if (!safe_path(f))
+            {
+                free(json);
+                free(sums);
+                reply(client, "err SHA256SUMS names an unsafe path: %s", f);
+                return;
+            }
+            snprintf(paths[count], sizeof(paths[count]), "%s", f);
+            for (int i = 0; i < 64; i++)
+                hashes[count][i] = (char)(hex[i] >= 'A' && hex[i] <= 'F' ? hex[i] + 32 : hex[i]);
+            hashes[count][64] = '\0';
+            has_eboot |= strcmp(f, "eboot.bin") == 0;
+            count++;
         }
-        FILE *const file = fopen(temp[i], "wb");
-        if (file == NULL)
-        {
-            free(sums);
-            reply(client, "err cannot write %s", temp[i]);
-            return;
-        }
+        line = strchr(line, '\n');
+        if (line != NULL)
+            line++;
+    }
+    free(sums);
+    if (!has_eboot)
+    {
+        free(json);
+        reply(client, "err SHA256SUMS does not list eboot.bin");
+        return;
+    }
+    // Each file to <path>.new, checked; any failure removes them all and changes nothing
+    int fetched = 0;
+    for (int i = 0; i < count; i++)
+    {
+        char asset[200], target[320];
+        snprintf(asset, sizeof(asset), "%s", paths[i]);
+        for (char *c = asset; *c != '\0'; c++)
+            if (*c == '/')
+            {
+                memmove(c + 2, c + 1, strlen(c + 1) + 1);
+                c[0] = '_';
+                c[1] = '_';
+                c++;
+            }
+        snprintf(target, sizeof(target), "%s/%s.new", folder, paths[i]);
+        make_parents(target);
+        FILE *file = NULL;
         sha256_t hash;
         sha256_init(&hash);
-        const int status = http_get(urls[i], NULL, NULL, 256u << 20, file, &hash);
-        fclose(file);
+        int status = -1;
+        if (asset_url(json, asset, url, sizeof(url)) == 0 && (file = fopen(target, "wb")) != NULL)
+        {
+            status = http_get(url, NULL, NULL, 256u << 20, file, &hash);
+            fclose(file);
+        }
         char got[65];
         sha256_hex(&hash, got);
-        if (status != 200 || strcmp(got, want) != 0)
+        if (status != 200 || strcmp(got, hashes[i]) != 0)
         {
-            unlink(temp[i]);
-            if (i == 1)
-                unlink(temp[0]);
-            free(sums);
-            reply(client, "err %s: %s", names[i], status != 200 ? "download failed" : "SHA-256 does not match; nothing changed");
-            log_line("cflaunch: %s status %d sha256 %s, expected %s", names[i], status, got, want);
+            log_line("cflaunch: %s (asset %s) status %d sha256 %s, expected %s", paths[i], asset, status, got, hashes[i]);
+            for (int j = 0; j <= i; j++)
+            {
+                snprintf(target, sizeof(target), "%s/%s.new", folder, paths[j]);
+                unlink(target);
+            }
+            free(json);
+            reply(client, "err %s: %s - nothing was changed", paths[i],
+                  status != 200 ? "could not download it" : "SHA-256 does not match");
+            return;
+        }
+        fetched++;
+    }
+    free(json);
+    // All verified: put them in place
+    for (int i = 0; i < count; i++)
+    {
+        char from[320], to[320];
+        snprintf(from, sizeof(from), "%s/%s.new", folder, paths[i]);
+        snprintf(to, sizeof(to), "%s/%s", folder, paths[i]);
+        if (rename(from, to) != 0)
+        {
+            reply(client, "err could not replace %s: %s", to, strerror(errno));
             return;
         }
     }
-    free(sums);
-    // Both verified: put them in place
-    for (int i = 0; i < 2; i++)
-        if (rename(temp[i], final_path[i]) != 0)
-        {
-            reply(client, "err could not replace %s: %s", final_path[i], strerror(errno));
-            return;
-        }
-    log_line("cflaunch: installed %s %s into %s", repo, tag, folder);
-    reply(client, "ok %s", tag);
+    log_line("cflaunch: installed %s %s (%d files) into %s", repo, tag, fetched, folder);
+    reply(client, "ok %s %d", tag, fetched);
 }
 
 // Answer one command. Returns 0 to keep serving, -1 to leave the console.
@@ -1275,7 +1725,7 @@ static int handle_command(int client, char *line)
     const char *const title = strtok(NULL, " \t");
     if (strcmp(command, "ping") == 0)
     {
-        reply(client, "ok cflaunch 5 pid=%d", (int)getpid());
+        reply(client, "ok cflaunch 8 pid=%d", (int)getpid());
         return 0;
     }
     if (strcmp(command, "status") == 0)
@@ -1327,6 +1777,31 @@ static int handle_command(int client, char *line)
     if (strcmp(command, "list") == 0)
     {
         list_titles(client);
+        return 0;
+    }
+    if (strcmp(command, "art") == 0)
+    {
+        send_art(client, title);
+        return 0;
+    }
+    if (strcmp(command, "playtime") == 0)
+    {
+        send_playtime(client);
+        return 0;
+    }
+    if (strcmp(command, "storage") == 0)
+    {
+        send_storage(client);
+        return 0;
+    }
+    if (strcmp(command, "backup") == 0 || strcmp(command, "restore") == 0)
+    {
+        backup_or_restore(client, title, strcmp(command, "restore") == 0);
+        return 0;
+    }
+    if (strcmp(command, "log") == 0)
+    {
+        send_log(client);
         return 0;
     }
     if (strcmp(command, "update-check") == 0)
@@ -1382,6 +1857,13 @@ static int handle_command(int client, char *line)
             reply(client, "err usage: switch <FROM> <TO>, two title ids");
             return 0;
         }
+        if (strcmp(title, target) == 0)
+        {
+            // Starting a title while it is still closing froze the console
+            log_line("cflaunch: refused to restart %s from inside itself", title);
+            reply(client, "err refused: a title cannot restart itself; open it again from the home screen");
+            return 0;
+        }
         // Answer first: the caller quits itself through the shell as soon as it
         // has the answer. Wait for it to be gone (up to 15 s); only a caller
         // that hangs is closed from outside.
@@ -1415,8 +1897,8 @@ static int handle_command(int client, char *line)
             // Bring Cover Flow back rather than leave the console on the home screen
             (void)start_title(title, &name, &code, detail, sizeof(detail));
         }
-        else if (come_back && strcmp(title, target) != 0)
-            watch_start(target, title);
+        else if (strcmp(title, target) != 0)
+            watch_start(target, title, come_back);
         return 0;
     }
     if (strcmp(command, "launch") == 0)
@@ -1546,7 +2028,7 @@ int main(int argc, char *argv[])
         close(server);
         return 1;
     }
-    log_line("cflaunch 5: listening (list, icon, size, where, switch, update)");
+    log_line("cflaunch 8: listening");
     for (;;)
     {
         struct pollfd ready = {server, POLLIN, 0};

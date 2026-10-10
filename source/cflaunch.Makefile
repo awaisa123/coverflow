@@ -17,7 +17,7 @@ OUTPUT := $(ROOT)/build/cflaunch
 ELF := $(OUTPUT)/cflaunch.elf
 
 CFLAGS := -std=c11 -O2 -g -Wall -Wextra -Werror
-LDLIBS := -lSceSystemService -lSceUserService -lSceNet -lSceSsl -lSceHttp2
+LDLIBS := -lSceSystemService -lSceUserService -lSceNet -lSceSsl -lSceHttp2 -lSceHttp
 
 all: $(ELF)
 
