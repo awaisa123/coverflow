@@ -398,7 +398,7 @@ public:
 		size_t p = json.find(needle);
 		if (p == std::string::npos) return "";
 		p += needle.size();
-		while (p < json.size() && (json[p] == ' ' || json[p] == '\\n' || json[p] == '\\r' || json[p] == '\\t')) p++;
+		while (p < json.size() && (json[p] == ' ' || json[p] == '\n' || json[p] == '\r' || json[p] == '\t')) p++;
 		if (p >= json.size() || json[p] != '{') return "";
 		const size_t start = p;
 		int depth = 0;
@@ -407,7 +407,7 @@ public:
 			const char c = json[p];
 			if (inString) {
 				if (escaped) escaped = false;
-				else if (c == '\\\\') escaped = true;
+				else if (c == '\\') escaped = true;
 				else if (c == '"') inString = false;
 				continue;
 			}
