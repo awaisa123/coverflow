@@ -233,7 +233,7 @@ public:
 	std::string dumpsMessage{ "Press Cross to refresh dump history." };
 	int dumpsIndex{ 0 };
 	int dumpIndex{ 0 };
-	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
+	int dumpDestination{ 1 }; // PS5 App Dumper currently supports USB destinations only
 	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: dumping, 3: result
 	float dumpProgress{ 0.0f };
 	std::string dumpStatus;
@@ -3420,7 +3420,7 @@ public:
 			dumpOpen = true;
 			manageDumpsOpen = false;
 			dumpIndex = 0;
-			dumpDestination = 0;
+			dumpDestination = 1;
 			dumpStage = 0;
 			dumpProgress = 0.0f;
 			break;
@@ -3813,8 +3813,13 @@ public:
 			if (p.pressed & PAD_CROSS) {
 				if (dumpStage == 0) {
 					if (dumpIndex < 2) {
-						dumpDestination = dumpIndex;
-						showMessage(dumpDestination == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
+						if (dumpIndex == 0) {
+							dumpDestination = 1;
+							showMessage("PS5 App Dumper writes to USB only. Choose USB drive.", 3.0f);
+						} else {
+							dumpDestination = 1;
+							showMessage("Destination: USB drive", 2.0f);
+						}
 					} else if (dumpIndex == 2) {
 						dumpStage = 1;
 						dumpIndex = 0;
@@ -4570,10 +4575,10 @@ public:
 						10.0f * s, ImDrawCornerFlags_All, focused ? 2.0f * s : 1.0f * s);
 					text(i == 0 ? "INTERNAL" : "USB DRIVE", 13.0f * s, dx + 14.0f * s, destY + 14.0f * s,
 						muted, 0.0f, false);
-					text(i == 0 ? "Console storage" : "External storage", 17.0f * s, dx + 14.0f * s,
-						destY + 39.0f * s, withAlpha(textC, a), 0.0f, false);
-					text(selected ? "SELECTED" : (i == 0 ? "Internal target" : "USB target"), 12.0f * s,
-						dx + 14.0f * s, destY + 72.0f * s, selected ? withAlpha(accentC, a) : muted, 0.0f, false);
+					text(i == 0 ? "Not supported by dumper" : "External storage", 17.0f * s, dx + 14.0f * s,
+						destY + 39.0f * s, withAlpha(i == 0 ? muted : textC, a), 0.0f, false);
+					text(i == 0 ? "UNAVAILABLE" : (selected ? "SELECTED" : "USB target"), 12.0f * s,
+						dx + 14.0f * s, destY + 72.0f * s, selected && i == 1 ? withAlpha(accentC, a) : muted, 0.0f, false);
 				}
 				const float btnY = destY + destH + 20.0f * s, btnH = 46.0f * s;
 				const float continueW = rw * 0.62f, cancelX = rx + continueW + 10.0f * s;
@@ -4590,7 +4595,7 @@ public:
 				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
 					IM_COL32(77, 67, 45, (int)(105 * a)), 8.0f * s);
 				text("NOTE", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s, IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
-				text("Requires the external PS5 App Dumper payload.", 14.0f * s, rx + 12.0f * s,
+				text("USB-only output; progress and final status are reported by the external dumper.", 13.0f * s, rx + 12.0f * s,
 					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
 			} else if (dumpStage == 1) {
 				text("Review dump request", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
