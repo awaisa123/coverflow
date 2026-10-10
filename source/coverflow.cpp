@@ -492,7 +492,7 @@ public:
 		const std::string form = "titles=" + urlEncode(titleId) +
 			"&target=" + urlEncode(target) + "&replace=0";
 		const std::string response = dumperHttp(port, "POST", "/api/queue/start", form, 10);
-		if (response.find("\\"started\\":true") == std::string::npos) {
+		if (response.find("\"started\":true") == std::string::npos) {
 			std::string err = jsonString(response, "error");
 			if (err.empty()) err = response.empty() ?
 				"PS5 App Dumper did not accept the queue request." : response;
