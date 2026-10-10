@@ -4352,67 +4352,210 @@ public:
 			}
 		}
 
-		// ---- Dump Game / App: complete navigable UI preview; no package extraction or file copying
+		// ---- Dump Game / App: native PS5 layout matching the desktop UI concept
 		if (menuAnim > 0.01f && menuOpen && dumpOpen && current()) {
 			const Game &game = *current();
-			const float a = menuAnim, w = 900.0f * s, h = 610.0f * s;
+			const float a = menuAnim;
+			const float w = 1120.0f * s, h = 650.0f * s;
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
 			panel(x0, y0, w, h, a);
-			const float pad = 36.0f * s;
-			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 48.0f * s;
-			text("Dump Game / App", 32.0f * s, rowX, y0 + 26.0f * s, withAlpha(textC, a));
-			text(fit(game.title, 22.0f * s, rowW), 22.0f * s, rowX, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("TITLE ID", 16.0f * s, rowX, y0 + 112.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, rowX, y0 + 136.0f * s, withAlpha(textC, a), 0.0f, false);
 
-			const float rowY = y0 + 172.0f * s;
-			std::vector<std::string> dumpLabels;
+			const float pad = 28.0f * s;
+			const float leftX = x0 + pad, leftW = 300.0f * s;
+			const float gap = 22.0f * s;
+			const float rightX = leftX + leftW + gap, rightW = w - (rightX - x0) - pad;
+			const float topY = y0 + 24.0f * s;
+			const float muted = withAlpha(dimC, a);
+			const float bodyY = y0 + 104.0f * s;
+
+			// Header and compact three-step indicator.
+			text("DUMP GAME / APP", 29.0f * s, leftX, topY, withAlpha(textC, a));
+			text("GAME MANAGER", 13.0f * s, x0 + w - pad, topY + 8.0f * s, withAlpha(accentC, a), 1.0f, false);
+			const char *stageName = dumpStage == 0 ? "DESTINATION" : dumpStage == 1 ? "CONFIRM" :
+				(dumpStage == 2 ? "DUMP IN PROGRESS" : (dumpQueued ? "DUMP QUEUED" : (dumpSucceeded ? "COMPLETE" : "FAILED")));
+			text(stageName, 14.0f * s, rightX, y0 + 65.0f * s, muted, 0.0f, false);
+			const float stepGap = 8.0f * s, stepW = (rightW - stepGap * 2.0f) / 3.0f;
+			for (int i = 0; i < 3; i++) {
+				const float sx = rightX + i * (stepW + stepGap), sy = y0 + 91.0f * s;
+				const bool done = i < dumpStage || dumpStage == 3;
+				dl->AddRectFilled(ImVec2(sx, sy), ImVec2(sx + stepW, sy + 5.0f * s),
+					done ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(30 * a)), 3.0f * s);
+			}
+
+			// Left column: real selected title, never fictional sample data.
+			const float cardY = bodyY, cardH = 258.0f * s;
+			dl->AddRectFilled(ImVec2(leftX, cardY), ImVec2(leftX + leftW, cardY + cardH),
+				IM_COL32(20, 31, 49, (int)(245 * a)), 13.0f * s);
+			dl->AddRect(ImVec2(leftX, cardY), ImVec2(leftX + leftW, cardY + cardH),
+				IM_COL32(255, 255, 255, (int)(32 * a)), 13.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float artX = leftX + 18.0f * s, artY = cardY + 18.0f * s;
+			const float artW = 82.0f * s, artH = 106.0f * s;
+			dl->AddRectFilled(ImVec2(artX, artY), ImVec2(artX + artW, artY + artH),
+				withAlpha(accentC, a * 0.82f), 9.0f * s);
+			std::string mark = game.title.empty() ? "?" : game.title.substr(0, 1);
+			text(mark, 37.0f * s, artX + artW * 0.5f, artY + artH * 0.5f,
+				withAlpha(white, a), 0.5f, true);
+			const float titleX = artX + artW + 14.0f * s;
+			text(fit(game.title, 20.0f * s, leftW - 132.0f * s), 20.0f * s, titleX, artY + 5.0f * s,
+				withAlpha(textC, a), 0.0f, false);
+			text(game.platform.empty() ? "Installed application" : game.platform + " title", 14.0f * s,
+				titleX, artY + 34.0f * s, muted, 0.0f, false);
+			text(game.titleId.empty() ? "No title ID" : game.titleId, 13.0f * s,
+				titleX, artY + 59.0f * s, withAlpha(accentC, a), 0.0f, false);
+			const float infoY = artY + artH + 20.0f * s;
+			text("INSTALLED SIZE", 12.0f * s, artX, infoY, muted, 0.0f, false);
+			text(game.bytes > 0 ? formatSize(game.bytes) : "Checking size…", 19.0f * s,
+				artX, infoY + 19.0f * s, withAlpha(textC, a), 0.0f, false);
+			dl->AddLine(ImVec2(artX, infoY + 52.0f * s), ImVec2(leftX + leftW - 18.0f * s, infoY + 52.0f * s),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 1.0f * s);
+			text("Selected from your Cover Flow library", 13.0f * s, artX, infoY + 64.0f * s,
+				muted, 0.0f, false);
+
+			const float info2Y = cardY + cardH + 14.0f * s;
+			text("BEFORE YOU START", 13.0f * s, leftX + 2.0f * s, info2Y, withAlpha(accentC, a), 0.0f, false);
+			text("Keep the destination connected", 15.0f * s, leftX + 2.0f * s, info2Y + 25.0f * s,
+				withAlpha(textC, a), 0.0f, false);
+			text("while the external dumper is working.", 14.0f * s, leftX + 2.0f * s, info2Y + 47.0f * s,
+				muted, 0.0f, false);
+			text("Queue accepted does not mean completed.", 13.0f * s, leftX + 2.0f * s, info2Y + 77.0f * s,
+				muted, 0.0f, false);
+
+			// Right workflow card.
+			const float panelY = bodyY, panelH = h - (bodyY - y0) - 42.0f * s;
+			dl->AddRectFilled(ImVec2(rightX, panelY), ImVec2(rightX + rightW, panelY + panelH),
+				IM_COL32(13, 22, 36, (int)(242 * a)), 13.0f * s);
+			dl->AddRect(ImVec2(rightX, panelY), ImVec2(rightX + rightW, panelY + panelH),
+				IM_COL32(255, 255, 255, (int)(28 * a)), 13.0f * s, ImDrawCornerFlags_All, 1.0f * s);
+			const float rx = rightX + 22.0f * s, rw = rightW - 44.0f * s;
+			const float contentY = panelY + 22.0f * s;
+			const std::string destinationName = dumpDestination == 0 ? "Internal storage" : "USB drive";
+
 			if (dumpStage == 0) {
-				dumpLabels = { "Internal storage", "USB drive", "Continue", "Cancel" };
+				text("Choose destination", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text("Where should the dumper write the output?", 15.0f * s, rx, contentY + 31.0f * s, muted, 0.0f, false);
+				const float destY = contentY + 68.0f * s, destGap = 12.0f * s;
+				const float destW = (rw - destGap) * 0.5f, destH = 104.0f * s;
+				for (int i = 0; i < 2; i++) {
+					const float dx = rx + i * (destW + destGap);
+					const bool selected = dumpDestination == i;
+					const bool focused = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(dx, destY), ImVec2(dx + destW, destY + destH),
+						selected ? withAlpha(accentC, a * 0.30f) : IM_COL32(255, 255, 255, (int)(12 * a)), 10.0f * s);
+					dl->AddRect(ImVec2(dx, destY), ImVec2(dx + destW, destY + destH),
+						IM_COL32(112, 164, 255, (int)((focused ? 210 : selected ? 120 : 42) * a)),
+						10.0f * s, ImDrawCornerFlags_All, focused ? 2.0f * s : 1.0f * s);
+					text(i == 0 ? "INTERNAL" : "USB DRIVE", 13.0f * s, dx + 14.0f * s, destY + 14.0f * s,
+						muted, 0.0f, false);
+					text(i == 0 ? "Console storage" : "External storage", 17.0f * s, dx + 14.0f * s,
+						destY + 39.0f * s, withAlpha(textC, a), 0.0f, false);
+					text(selected ? "SELECTED" : (i == 0 ? "Internal target" : "USB target"), 12.0f * s,
+						dx + 14.0f * s, destY + 72.0f * s, selected ? withAlpha(accentC, a) : muted, 0.0f, false);
+				}
+				const float btnY = destY + destH + 20.0f * s, btnH = 46.0f * s;
+				const float continueW = rw * 0.62f, cancelX = rx + continueW + 10.0f * s;
+				const bool contFocus = dumpIndex == 2, cancelFocus = dumpIndex == 3;
+				dl->AddRectFilled(ImVec2(rx, btnY), ImVec2(rx + continueW, btnY + btnH),
+					contFocus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+				dl->AddRectFilled(ImVec2(cancelX, btnY), ImVec2(rx + rw, btnY + btnH),
+					cancelFocus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+				text("Continue  >", 17.0f * s, rx + 14.0f * s, btnY + 13.0f * s,
+					withAlpha(contFocus ? white : textC, a), 0.0f, false);
+				text("Cancel", 17.0f * s, cancelX + 12.0f * s, btnY + 13.0f * s,
+					withAlpha(cancelFocus ? white : textC, a), 0.0f, false);
+				const float noteY = btnY + btnH + 23.0f * s;
+				dl->AddRectFilled(ImVec2(rx, noteY), ImVec2(rx + rw, noteY + 58.0f * s),
+					IM_COL32(77, 67, 45, (int)(105 * a)), 8.0f * s);
+				text("NOTE", 12.0f * s, rx + 12.0f * s, noteY + 8.0f * s, IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
+				text("Requires the external PS5 App Dumper payload.", 14.0f * s, rx + 12.0f * s,
+					noteY + 29.0f * s, withAlpha(textC, a), 0.0f, false);
 			} else if (dumpStage == 1) {
-				dumpLabels = { "Run UI preview", "Back to destination" };
-			} else if (dumpStage == 3) {
-				dumpLabels = { "Choose another destination", "Close" };
-			}
-			for (int i = 0; i < (int)dumpLabels.size(); i++) {
-				const float ry = rowY + i * (rowH + 7.0f * s);
-				const bool on = i == dumpIndex;
-				dl->AddRectFilled(ImVec2(rowX, ry), ImVec2(rowX + rowW, ry + rowH),
-					on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
-				text(dumpLabels[i], 20.0f * s, rowX + 20.0f * s, ry + 12.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				if (dumpStage == 0 && i < 2 && dumpDestination == i) {
-					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 15.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
+				text("Review dump request", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text("Confirm the selected title and destination.", 15.0f * s, rx, contentY + 31.0f * s, muted, 0.0f, false);
+				const float rowsY = contentY + 72.0f * s, rowH = 48.0f * s;
+				const char *labels[] = { "Selected title", "Title ID", "Platform", "Estimated size", "Destination", "Operation" };
+				const std::string values[] = { game.title, game.titleId.empty() ? "Unavailable" : game.titleId,
+					game.platform.empty() ? "Application" : game.platform,
+					game.bytes > 0 ? formatSize(game.bytes) : "Unknown",
+					destinationName, "External PS5 App Dumper" };
+				for (int i = 0; i < 6; i++) {
+					const float ry = rowsY + i * rowH;
+					if (i % 2 == 0) dl->AddRectFilled(ImVec2(rx, ry), ImVec2(rx + rw, ry + rowH - 2.0f * s),
+						IM_COL32(255, 255, 255, (int)(9 * a)), 5.0f * s);
+					text(labels[i], 14.0f * s, rx + 10.0f * s, ry + 14.0f * s, muted, 0.0f, false);
+					text(fit(values[i], 15.0f * s, rw * 0.52f), 15.0f * s, rx + rw - 10.0f * s,
+						ry + 14.0f * s, withAlpha(textC, a), 1.0f, false);
+				}
+				const float btnY = rowsY + 6.0f * rowH + 15.0f * s, btnH = 44.0f * s;
+				const float btnW = (rw - 10.0f * s) * 0.5f;
+				for (int i = 0; i < 2; i++) {
+					const float bx = rx + i * (btnW + 10.0f * s);
+					const bool focus = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(bx, btnY), ImVec2(bx + btnW, btnY + btnH),
+						focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+					text(i == 0 ? "Start dump" : "Back", 16.0f * s, bx + 14.0f * s, btnY + 12.0f * s,
+						withAlpha(focus ? white : textC, a), 0.0f, false);
+				}
+				text("The dumper may launch the selected title and close Cover Flow.", 13.0f * s, rx,
+					panelY + panelH - 29.0f * s, muted, 0.0f, false);
+			} else if (dumpStage == 2) {
+				text("Submitting to PS5 App Dumper", 24.0f * s, rx, contentY, withAlpha(textC, a), 0.0f, false);
+				text(dumpStatus.empty() ? "Preparing dumper…" : dumpStatus, 16.0f * s, rx, contentY + 36.0f * s,
+					muted, 0.0f, false);
+				const float barY = contentY + 88.0f * s, barH = 12.0f * s;
+				dl->AddRectFilled(ImVec2(rx, barY), ImVec2(rx + rw, barY + barH),
+					IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
+				if (dumpProgress > 0.0f) dl->AddRectFilled(ImVec2(rx, barY),
+					ImVec2(rx + rw * dumpProgress, barY + barH), withAlpha(accentC, a), 6.0f * s);
+				const int percent = (int)(dumpProgress * 100.0f);
+				text(dumpProgress > 0.0f ? std::to_string(percent) + "% reported by dumper" : "Waiting for dumper acknowledgement",
+					15.0f * s, rx, barY + 22.0f * s, withAlpha(textC, a), 0.0f, false);
+				dl->AddRectFilled(ImVec2(rx, barY + 66.0f * s), ImVec2(rx + rw, barY + 122.0f * s),
+					IM_COL32(77, 67, 45, (int)(90 * a)), 8.0f * s);
+				text("KEEP DESTINATION CONNECTED", 12.0f * s, rx + 12.0f * s, barY + 75.0f * s,
+					IM_COL32(255, 197, 110, (int)(255 * a)), 0.0f, false);
+				text("Cover Flow will show a queued status if the dumper accepts.", 14.0f * s, rx + 12.0f * s,
+					barY + 96.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("For actual extraction progress, check the dumper's own web UI/log.", 14.0f * s, rx,
+					barY + 151.0f * s, muted, 0.0f, false);
+			} else {
+				const bool success = dumpQueued || dumpSucceeded;
+				const ImU32 statusCol = success ? IM_COL32(112, 224, 172, (int)(255 * a)) : IM_COL32(255, 124, 140, (int)(255 * a));
+				dl->AddCircleFilled(ImVec2(rx + 28.0f * s, contentY + 20.0f * s), 20.0f * s,
+					success ? IM_COL32(21, 60, 53, (int)(255 * a)) : IM_COL32(68, 29, 39, (int)(255 * a)), 32);
+				text(success ? "OK" : "!", 16.0f * s, rx + 28.0f * s, contentY + 20.0f * s,
+					statusCol, 0.5f, true);
+				text(dumpQueued ? "Dump queued" : (dumpSucceeded ? "Dump completed" : "Dump could not start"),
+					24.0f * s, rx + 58.0f * s, contentY + 8.0f * s, withAlpha(textC, a), 0.0f, false);
+				text(dumpQueued ? "The request was accepted, not completed yet." :
+					(dumpSucceeded ? "The dumper reported completion." : "Check the message below and the dumper log."),
+					15.0f * s, rx + 58.0f * s, contentY + 38.0f * s, muted, 0.0f, false);
+				const float resultY = contentY + 91.0f * s;
+				dl->AddRectFilled(ImVec2(rx, resultY), ImVec2(rx + rw, resultY + 150.0f * s),
+					IM_COL32(255, 255, 255, (int)(10 * a)), 8.0f * s);
+				text("TITLE", 12.0f * s, rx + 12.0f * s, resultY + 12.0f * s, muted, 0.0f, false);
+				text(fit(game.title, 16.0f * s, rw - 24.0f * s), 16.0f * s, rx + 12.0f * s,
+					resultY + 31.0f * s, withAlpha(textC, a), 0.0f, false);
+				text("DESTINATION", 12.0f * s, rx + 12.0f * s, resultY + 61.0f * s, muted, 0.0f, false);
+				text(destinationName, 16.0f * s, rx + 12.0f * s, resultY + 80.0f * s, withAlpha(textC, a), 0.0f, false);
+				std::string detail = dumpResult;
+				if (detail.size() > 150) detail = detail.substr(0, 147) + "...";
+				text(fit(detail, 13.0f * s, rw - 24.0f * s), 13.0f * s, rx + 12.0f * s,
+					resultY + 117.0f * s, muted, 0.0f, false);
+				const float btnY = resultY + 166.0f * s, btnH = 44.0f * s;
+				const float btnW = (rw - 10.0f * s) * 0.5f;
+				for (int i = 0; i < 2; i++) {
+					const float bx = rx + i * (btnW + 10.0f * s);
+					const bool focus = dumpIndex == i;
+					dl->AddRectFilled(ImVec2(bx, btnY), ImVec2(bx + btnW, btnY + btnH),
+						focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
+					text(i == 0 ? "Choose another destination" : "Close", 15.0f * s, bx + 12.0f * s,
+						btnY + 12.0f * s, withAlpha(focus ? white : textC, a), 0.0f, false);
 				}
 			}
-			const float statusY = y0 + 398.0f * s;
-			if (dumpStage == 0) {
-				text("DESTINATION", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text(dumpDestination == 0 ? "Internal storage" : "USB drive", 19.0f * s, rowX, statusY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("Choose where an export would be saved.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 1) {
-				text("READY TO BACK UP FILES", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("Uses the external PS5 App Dumper payload to create a game dump.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 2 || dumpStage == 3) {
-				text(dumpStage == 2 ? "SUBMITTING GAME / APP DUMP…" : (dumpQueued ? "DUMP QUEUED" : (dumpSucceeded ? "DUMP FINISHED" : "DUMP FAILED")), 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				const float barY = statusY + 30.0f * s;
-				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
-				if (dumpProgress > 0.0f) {
-					dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW * dumpProgress, barY + 14.0f * s), withAlpha(accentC, a), 6.0f * s);
-				}
-				if (dumpStage == 2) {
-					text(dumpStatus.empty() ? "Waiting for dumper…" : dumpStatus, 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-					text("Live progress comes from the dumper; keep the destination connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-				} else {
-					text(dumpQueued ? "Monitor the PS5 App Dumper web interface/log for progress." : (dumpSucceeded ? "Dumper reported a completed dump." : "The dumper did not confirm completion."), 16.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-					std::string detail = dumpResult;
-					if (detail.size() > 100) detail = detail.substr(0, 97) + "...";
-					text(detail, 13.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-				}
-			}
-			const char *navigationHint = dumpStage == 2 ? "Copy in progress" : "D-pad: navigate";
+
+			const char *navigationHint = dumpStage == 2 ? "Waiting for dumper" : "D-pad: navigate";
 			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
-				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
+				x0 + w * 0.5f, y0 + h - 20.0f * s, a);
 		}
 
 		// ---- settings
