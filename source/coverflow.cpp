@@ -3433,7 +3433,8 @@ public:
 					dumpStage = 3;
 					dumpIndex = 0;
 				} else {
-					dumpProgress = std::fmod(dumpProgress + dt * 0.22f, 0.82f);
+					dumpProgress += dt * 0.22f;
+					if (dumpProgress > 0.82f) dumpProgress = 0.0f;
 				}
 			}
 			const int dumpItemCount = dumpStage == 0 ? 4 : (dumpStage == 1 || dumpStage == 3 ? 2 : 0);
