@@ -6,6 +6,7 @@ layout(push_constant) uniform Push {
 } pc;
 layout(set = 0, binding = 0) uniform sampler2D coverTexture;
 layout(location = 0) in vec2 inUV;
+layout(location = 1) in vec2 inTexUV;
 layout(location = 0) out vec4 outColor;
 
 // Signed distance to a rounded square filling the quad (negative inside)
@@ -17,7 +18,9 @@ float roundedBox(vec2 uv, float radius)
 
 void main()
 {
-	const float kind = pc.params.w;
+	const float kind = mod(pc.params.w, 10.0);
+	// A tall cover is 3:4, so its corners are rounded on that shape
+	const vec2 shape = pc.params.w > 9.5 ? vec2(0.75, 1.0) : vec2(1.0);
 	if (kind > 2.5) {
 		// The glow behind the selected cover: the accent colour fading out from its edge
 		float d = roundedBox((inUV - 0.5) * 1.3 + 0.5, 0.06);
@@ -32,9 +35,10 @@ void main()
 		outColor = vec4(0.0, 0.0, 0.0, exp(-dot(p, p) * 2.6) * 0.6 * pc.params.z);
 		return;
 	}
-	float d = roundedBox(inUV, 0.035);
+	vec2 q = abs((inUV - 0.5) * shape) - (0.5 * shape - 0.035);
+	float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - 0.035;
 	float mask = 1.0 - smoothstep(-0.003, 0.002, d);
-	vec3 color = texture(coverTexture, inUV).rgb * pc.params.y;
+	vec3 color = texture(coverTexture, inTexUV).rgb * pc.params.y;
 	float alpha = pc.params.z * mask;
 	if (pc.params.x > 0.0) {
 		// The reflection fades out going down from the floor (inUV.y = 1 at the floor)

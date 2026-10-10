@@ -34,7 +34,7 @@
  * starts the game.
  *
  * Themes: /app0/theme/theme.ini, every key optional:
- *   heading = Library            the title at the top
+ *   heading = Cover Flow         the title at the top
  *   accent = 77,115,242          the backdrop glow (R,G,B 0-255)
  *   text = 235,238,245           titles
  *   dim = 150,158,175            subtitles and hints
@@ -163,8 +163,8 @@ struct Sha256 {
 	}
 };
 
-static constexpr const char *coverFlowVersion = "v14";
-static constexpr int launcherVersion = 8; // the launcher in the title folder
+static constexpr const char *coverFlowVersion = "v22";
+static constexpr int launcherVersion = 12; // the launcher in the title folder
 
 class VulkanExample : public VulkanExampleBase
 {
@@ -188,6 +188,10 @@ public:
 		// Where its cover comes from, tried in this order by the cover loader
 		std::string customPath, cachePath, fetchId;
 		int demoIndex{ 0 };
+		// Cover Flow's own overrides (covers/custom/): never the console's
+		std::string originalTitle, gamesTxtPath;
+		bool renamed{ false }, customCover{ false };
+		bool reload{ false }; // a new cover is on its way to replace the shown one
 	};
 	vks::Texture2D placeholderTexture;
 	VkDescriptorSet placeholderSet{ VK_NULL_HANDLE };
@@ -220,11 +224,6 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
-	bool dumpOpen{ false }; // Dump Game / App workflow preview; never copies files
-	int dumpIndex{ 0 };
-	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
-	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: simulated progress, 3: preview result
-	float dumpProgress{ 0.0f };
 	int collectionIndex{ 0 };
 	static constexpr int gridCols = 7;
 	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
@@ -249,6 +248,7 @@ public:
 		bool artBackgrounds{ true };
 		bool sounds{ true };
 		bool grid{ false };
+		int layout{ 0 }; // 0 Showcase (tall covers, gentle angle), 1 Classic
 		std::string themeName; // a built-in theme, a folder in themes/, or "" for theme/ (the custom one) or Default
 	} settings;
 	static constexpr const char *quitNames[4] = { "hold OPTIONS + SHARE", "hold L1 + R1 + OPTIONS", "hold CIRCLE (2 seconds)",
@@ -276,10 +276,20 @@ public:
 	float updateCheckDelay{ 3.0f };
 
 	// Sorting and filtering, kept between runs with the favourites and hidden games
-	static constexpr int sortCount = 5, baseFilters = 7, collectionCount = 6, filterCount = baseFilters + collectionCount;
+	static constexpr int sortCount = 6, baseFilters = 7, collectionCount = 6, filterCount = baseFilters + collectionCount;
 	int sortMode{ 0 };   // 0 name, 1 title id, 2 recently installed, 3 recently played, 4 most played
 	int filterMode{ 0 }; // 0 all, 1 favourites, 2 PS5, 3 PS4, 4 emulators, 5 homebrew, 6 hidden, 7.. collections
-	static constexpr const char *sortNames[sortCount] = { "Name A-Z", "Title ID", "Recently installed", "Recently played", "Most played" };
+	// Search (R3): an on-screen keyboard; while there is a search, every game that is not
+	// hidden and matches it is shown, whatever the filter. Not saved between runs.
+	bool searchOpen{ false };
+	std::string searchQuery;
+	int searchRow{ 1 }, searchCol{ 0 };
+	float searchAnim{ 0.0f };
+	static constexpr int searchCols = 10, searchMaxLength = 40;
+	static constexpr const char *searchRows[4] = { "1234567890", "QWERTYUIOP", "ASDFGHJKL'", "ZXCVBNM-:&" };
+	struct SearchKey { const char *label; int from, span; };
+	static constexpr SearchKey searchBottom[4] = { { "Space", 0, 3 }, { "Delete", 3, 2 }, { "Clear", 5, 2 }, { "Done", 7, 3 } };
+	static constexpr const char *sortNames[sortCount] = { "Name A-Z", "Title ID", "Recently installed", "Recently played", "Most played", "Largest first" };
 	static constexpr const char *baseFilterNames[baseFilters] = { "All games", "Favourites", "PS5 Games", "PS4 Games", "Emulators", "Homebrew Apps", "Hidden games" };
 	// Collections: six, named in coverflow.ini (collections = ...), a game in any of them
 	std::vector<std::string> collectionNames{ "Racing", "Co-op", "Playing now", "Finished", "Retro", "Family" };
@@ -318,7 +328,10 @@ public:
 	struct SizeResults {
 		std::mutex mutex;
 		std::map<std::string, long long> done;
+		int batches{ 0 }; // whole-library measurements finished
 	};
+	int sizeBatchesSeen{ 0 };
+	bool measuringAll{ false };
 	std::shared_ptr<SizeResults> sizeResults = std::make_shared<SizeResults>();
 	std::set<std::string> sizePending;
 
@@ -332,7 +345,7 @@ public:
 
 	// The theme
 	struct Theme {
-		std::string heading{ "Library" };
+		std::string heading{ "Cover Flow" };
 		glm::vec3 accent{ 0.30f, 0.45f, 0.95f };
 		ImU32 text{ IM_COL32(235, 238, 245, 255) };
 		ImU32 dim{ IM_COL32(150, 158, 175, 255) };
@@ -766,7 +779,7 @@ public:
 		int accent[3], text[3], dim[3];
 	};
 	static constexpr Preset presets[] = {
-		{ "Default", { 77, 115, 242 }, { 235, 238, 245 }, { 150, 158, 175 } },
+		{ "Default", { 0, 122, 255 }, { 240, 244, 252 }, { 150, 165, 195 } },
 		{ "Midnight", { 110, 90, 255 }, { 232, 230, 250 }, { 150, 145, 185 } },
 		{ "Racing Red", { 230, 50, 60 }, { 245, 238, 236 }, { 185, 160, 160 } },
 		{ "Emerald", { 40, 200, 140 }, { 232, 245, 240 }, { 145, 175, 165 } },
@@ -1112,12 +1125,12 @@ public:
 					if (answer.size() > limit) {
 						break;
 					}
-					// One-line answers end at their newline; list ends at "end"; icon at its length
+					// One-line answers end at their newline; list ends at "end"; icon and art at their length
 					if (answer.rfind("ok list", 0) == 0) {
 						if (answer.size() >= 4 && answer.compare(answer.size() - 4, 4, "end\n") == 0) {
 							break;
 						}
-					} else if (answer.rfind("ok ", 0) == 0 && command.rfind("icon", 0) == 0) {
+					} else if (answer.rfind("ok ", 0) == 0 && (command.rfind("icon", 0) == 0 || command.rfind("art ", 0) == 0)) {
 						const size_t nl = answer.find('\n');
 						if (nl != std::string::npos && answer.size() >= nl + 1 + std::strtoull(answer.c_str() + 3, nullptr, 10)) {
 							break;
@@ -1371,6 +1384,83 @@ public:
 		return list;
 	}
 
+	// ---------------------------------------------------------------- custom names and covers
+	// Kept in Cover Flow's own folder, covers/custom/: <TITLEID>.png or .jpg, and
+	// names.txt with "TITLEID | Name" lines. The console's own data is never touched.
+
+	std::string customDir() const { return appRoot() + "covers/custom/"; }
+
+	std::map<std::string, std::string> readNames(const std::string &path) const
+	{
+		std::map<std::string, std::string> names;
+		std::ifstream f(path);
+		std::string line;
+		while (f && std::getline(f, line)) {
+			line = trim(line);
+			const size_t bar = line.find('|');
+			if (line.empty() || line[0] == '#' || bar == std::string::npos) {
+				continue;
+			}
+			const std::string id = trim(line.substr(0, bar)), name = trim(line.substr(bar + 1));
+			if (isTitleId(id) && !name.empty() && name.size() < 120) {
+				names[id] = name;
+			}
+		}
+		return names;
+	}
+
+	void writeNames(const std::map<std::string, std::string> &names)
+	{
+		std::string out = "# Cover Flow names: TITLEID | Name (only Cover Flow shows these)\n";
+		for (const auto &[id, name] : names) {
+			out += id + " | " + name + "\n";
+		}
+		mkdir(customDir().c_str(), 0777);
+		writeFile(customDir() + "names.txt", out);
+	}
+
+	// Names that came in from USB join the list (they win), then the import file goes
+	std::map<std::string, std::string> loadCustomNames()
+	{
+		auto names = readNames(customDir() + "names.txt");
+		const std::string imported = customDir() + "names-import.txt";
+		struct stat st {};
+		if (stat(imported.c_str(), &st) == 0) {
+			for (const auto &[id, name] : readNames(imported)) {
+				names[id] = name;
+			}
+			writeNames(names);
+			std::remove(imported.c_str());
+		}
+		return names;
+	}
+
+	std::string customCoverFor(const std::string &id) const
+	{
+		for (const char *ext : { ".png", ".jpg", ".jpeg", ".PNG", ".JPG" }) {
+			const std::string path = customDir() + id + ext;
+			struct stat st {};
+			if (stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+				return path;
+			}
+		}
+		return "";
+	}
+
+	// Puts a game's overrides (or their absence) on it
+	void applyCustom(Game &g, const std::map<std::string, std::string> &names)
+	{
+		if (g.titleId.empty()) {
+			return;
+		}
+		auto it = names.find(g.titleId);
+		g.renamed = it != names.end();
+		g.title = g.renamed ? it->second : g.originalTitle;
+		const std::string cover = customCoverFor(g.titleId);
+		g.customCover = !cover.empty();
+		g.customPath = g.customCover ? cover : g.gamesTxtPath;
+	}
+
 	// The installed list (live or cached) with games.txt's overrides and extras;
 	// covers are only planned here and loaded in the background
 	void buildFromList(const std::vector<Entry> &list, bool live)
@@ -1378,6 +1468,7 @@ public:
 		const std::string covers = appRoot() + "covers/";
 		const std::string cache = covers + "auto/";
 		std::vector<Custom> custom = readGamesTxt();
+		const auto names = loadCustomNames();
 		std::set<std::string> used;
 		for (const Entry &e : list) {
 			if (e.id == ownTitleId) {
@@ -1401,6 +1492,9 @@ public:
 			Game &g = addGame(name, subtitle, e.id, e.bytes, e.installed);
 			g.contentId = e.contentId;
 			g.customPath = customPath;
+			g.originalTitle = name;
+			g.gamesTxtPath = customPath;
+			applyCustom(g, names);
 			g.cachePath = cache + e.id + ".png";
 			g.fetchId = live ? e.id : "";
 		}
@@ -1691,6 +1785,34 @@ public:
 		}
 	}
 
+	// "just now", "12 hours ago", "3 days ago", or the date for older ones
+	static std::string formatAgo(long long when)
+	{
+		const long long now = (long long)time(nullptr), d = now - when;
+		if (when <= 0) {
+			return "never";
+		}
+		if (d < 120) {
+			return "just now";
+		}
+		if (d < 3600) {
+			return std::to_string(d / 60) + " minutes ago";
+		}
+		if (d < 2 * 3600) {
+			return "an hour ago";
+		}
+		if (d < 86400) {
+			return std::to_string(d / 3600) + " hours ago";
+		}
+		if (d < 2 * 86400) {
+			return "yesterday";
+		}
+		if (d < 30 * 86400) {
+			return std::to_string(d / 86400) + " days ago";
+		}
+		return formatDate(when);
+	}
+
 	static std::string formatDuration(long long seconds)
 	{
 		if (seconds <= 0) {
@@ -1737,7 +1859,7 @@ public:
 	// ---------------------------------------------------------------- the cover loader
 
 	// Decode every game's cover on a worker thread, nearest the selection first
-	void startCoverLoader()
+	void startCoverLoader(const std::vector<int> &only = {})
 	{
 		struct Job {
 			int index;
@@ -1766,6 +1888,9 @@ public:
 				order.push_back(i); // games the filter hides, last
 			}
 		}
+		if (!only.empty()) {
+			order = only;
+		}
 		for (int i : order) {
 			const Game &g = games[i];
 			jobs.push_back({ i, g.customPath, g.cachePath, g.fetchId, g.demoIndex });
@@ -1777,7 +1902,7 @@ public:
 				std::string from;
 				if (!job.customPath.empty()) {
 					rgba = loadCover(job.customPath);
-					from = "custom (games.txt)";
+					from = job.customPath.find("/covers/custom/") != std::string::npos ? "your own cover" : "custom (games.txt)";
 				}
 				if (rgba.empty() && !job.cachePath.empty()) {
 					rgba = loadCover(job.cachePath);
@@ -1825,6 +1950,17 @@ public:
 		}
 		for (auto &[index, item] : batch) {
 			Game &g = games[index];
+			if (g.loaded && g.reload) {
+				// A new cover for one already shown: swap the image under the same set
+				vkDeviceWaitIdle(device);
+				g.texture.destroy();
+				g.texture.fromBuffer((void *)item.first.data(), item.first.size(), VK_FORMAT_R8G8B8A8_SRGB, coverSize, coverSize, vulkanDevice, queue);
+				VkWriteDescriptorSet write = vks::initializers::writeDescriptorSet(g.descriptorSet, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 0, &g.texture.descriptor);
+				vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
+				g.coverFrom = item.second;
+				g.reload = false;
+				continue;
+			}
 			if (g.loaded) {
 				continue;
 			}
@@ -1835,6 +1971,7 @@ public:
 			vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
 			g.coverFrom = item.second;
 			g.loaded = true;
+			g.reload = false;
 			coversLoaded++;
 		}
 	}
@@ -1905,6 +2042,7 @@ public:
 		settings.artBackgrounds = flag("art_backgrounds", true);
 		settings.sounds = flag("sounds", true);
 		settings.grid = flag("grid", false);
+		settings.layout = std::clamp(ini.count("layout") ? std::atoi(ini["layout"].c_str()) : 0, 0, 1);
 		settings.themeName = ini.count("theme_name") ? ini["theme_name"] : "";
 		if (ini.count("collections") && !ini["collections"].empty()) {
 			std::stringstream cs(ini["collections"]);
@@ -1962,7 +2100,7 @@ public:
 			"\nreflection = " + (settings.reflection >= 0 ? std::to_string(settings.reflection) : "") +
 			"\nangle = " + (settings.angle >= 0 ? std::to_string(settings.angle) : "") +
 			"\nart_backgrounds = " + (settings.artBackgrounds ? "1" : "0") + "\nsounds = " + (settings.sounds ? "1" : "0") +
-			"\ngrid = " + (settings.grid ? "1" : "0") + "\ntheme_name = " + settings.themeName +
+			"\ngrid = " + (settings.grid ? "1" : "0") + "\nlayout = " + std::to_string(settings.layout) + "\ntheme_name = " + settings.themeName +
 			"\ncollections = " + collectionsLine() + "\ncollection_members = " + membersLine() + "\n");
 	}
 
@@ -2012,6 +2150,41 @@ public:
 		return view.empty() ? nullptr : &games[view[std::clamp(selected, 0, (int)view.size() - 1)]];
 	}
 
+	// Search text as it is compared: lower case letters and digits only, so
+	// "spider man" finds "Marvel's Spider-Man 2"
+	static std::string searchKey(const std::string &text)
+	{
+		std::string out;
+		for (unsigned char c : text) {
+			if (std::isalnum(c)) {
+				out += (char)std::tolower(c);
+			}
+		}
+		return out;
+	}
+
+	// Where the search is in the game's name (shown or original) or title id; npos when it isn't
+	static size_t searchMatch(const Game &g, const std::string &query)
+	{
+		size_t best = searchKey(g.title).find(query);
+		for (const std::string *other : { &g.originalTitle, &g.titleId }) {
+			const size_t at = other->empty() ? std::string::npos : searchKey(*other).find(query);
+			if (at != std::string::npos && (best == std::string::npos || at < best)) {
+				best = at;
+			}
+		}
+		return best;
+	}
+
+	// The search changed: show its matches from the first
+	void searchChanged()
+	{
+		rebuildView();
+		selected = 0;
+		position = 0.0f;
+		gridScroll = 0.0f;
+	}
+
 	// Rebuild the view, keeping the selected game where it can
 	void rebuildView()
 	{
@@ -2019,10 +2192,12 @@ public:
 		const int keep = was ? (int)(was - games.data()) : -1;
 		const int keepSlot = selected;
 		view.clear();
+		const std::string query = searchKey(searchQuery);
 		for (int i = 0; i < (int)games.size(); i++) {
 			const Game &g = games[i];
 			const std::string &p = g.section;
-			const bool shown = filterMode == 6 ? isHidden(g)
+			const bool shown = !query.empty() ? !isHidden(g) && searchMatch(g, query) != std::string::npos
+				: filterMode == 6 ? isHidden(g)
 				: !isHidden(g) && (filterMode == 0 || (filterMode == 1 && isFavourite(g)) || (filterMode == 2 && p == "PS5") ||
 					(filterMode == 3 && p == "PS4") || (filterMode == 4 && p == "Emulators") || (filterMode == 5 && p == "Homebrew") ||
 					(filterMode >= baseFilters && inCollection(g, filterMode - baseFilters)));
@@ -2038,6 +2213,13 @@ public:
 			if (sortMode == 2 && x.installed != y.installed) {
 				return x.installed > y.installed;
 			}
+			if (sortMode == 5) {
+				// Unmeasured games (0 or -1) go last
+				const long long ax = std::max(0LL, x.bytes), ay = std::max(0LL, y.bytes);
+				if (ax != ay) {
+					return ax > ay;
+				}
+			}
 			if (sortMode == 3 || sortMode == 4) {
 				auto px = playTime.find(x.titleId), py = playTime.find(y.titleId);
 				const long long ax = px == playTime.end() ? 0 : (sortMode == 3 ? px->second.last : px->second.seconds);
@@ -2048,6 +2230,10 @@ public:
 			}
 			return lower(x.title) < lower(y.title);
 		});
+		if (!query.empty()) {
+			// Names that start with the search come first
+			std::stable_partition(view.begin(), view.end(), [&](int i) { return searchMatch(games[i], query) == 0; });
+		}
 		// The same game if it is still shown, otherwise the one now in its place
 		selected = view.empty() ? 0 : std::clamp(keepSlot, 0, (int)view.size() - 1);
 		for (int k = 0; k < (int)view.size(); k++) {
@@ -2199,11 +2385,67 @@ public:
 				filterMode = std::clamp(std::atoi(t + test.find("filter=") + 7), 0, filterCount - 1);
 			}
 			menuOpen = test.find("menu") != std::string::npos;
+			if (test.find("search=") != std::string::npos) {
+				// search=TEXT (underscores for spaces), up to the next space
+				const size_t at = test.find("search=") + 7, end = test.find(' ', at);
+				searchQuery = test.substr(at, end == std::string::npos ? std::string::npos : end - at);
+				std::replace(searchQuery.begin(), searchQuery.end(), '_', ' ');
+			}
+			if (test.find("keyboard") != std::string::npos) {
+				searchOpen = true;
+				searchAnim = 1.0f;
+				if (test.find("key=") != std::string::npos) {
+					// key=RC: row R (0-4), column C (0-9)
+					searchRow = std::clamp(test[test.find("key=") + 4] - '0', 0, 4);
+					searchCol = std::clamp(test[test.find("key=") + 5] - '0', 0, searchCols - 1);
+				}
+			}
 			if (test.find("category") != std::string::npos) {
 				categoryOpen = true;
 				categoryIndex = 3;
 			}
 			settingsOpen = test.find("settings") != std::string::npos;
+			if (settingsOpen) {
+				refreshDrives();
+			}
+			const size_t wz = test.find("wizard=");
+			if (wz != std::string::npos) {
+				const std::string which = test.substr(wz + 7, test.find(' ', wz) == std::string::npos ? std::string::npos : test.find(' ', wz) - wz - 7);
+				usbDrives = parseUsb("ok backups usb0|128849018880|256060514304|complete|1791590000|14|6|187200;usb1|30064771072|32212254720|none|0|0|0|0");
+				wizardDrive = 0;
+				wizardFocus = 0;
+				wizard = which == "confirm" ? WZ_CONFIRM : which == "manage" ? WZ_MANAGE : which == "restore" ? WZ_RESTORE_CONFIRM
+					: which == "done" ? WZ_DONE : which == "error" ? WZ_ERROR : which == "progress" ? WZ_PROGRESS : which == "empty" ? WZ_DRIVES : WZ_DRIVES;
+				if (which == "empty") {
+					usbDrives.clear();
+				}
+				if (which == "done") {
+					wizardResult = "Backed up 23 files (4.2 MB) to USB 1. Every copy was read back and checked.";
+				}
+				if (which == "error") {
+					wizardResult = "Backup cancelled. The backup on USB 1 is marked incomplete and will not be offered for restore.";
+				}
+				if (which == "runbackup") {
+					usbDrives = parseUsb("ok backups usb0|128849018880|256060514304|none|0|0|0|0");
+					startBackup();
+				}
+				if (which == "runrestore") {
+					usbDrives = parseUsb("ok backups usb0|128849018880|256060514304|complete|0|0|0|0");
+					startRestore();
+				}
+				if (which == "progress") {
+					auto job = std::make_shared<WizardJob>();
+					job->done = 9;
+					job->total = 16;
+					job->bytes = 3565158;
+					job->stage = "Copying custom/PPSA03541.png";
+					wizardJob = job;
+					wizardStarted = clock - 14.0f;
+				}
+			}
+			if (test.find("import") != std::string::npos) {
+				settingsChange(S_IMPORT, 0);
+			}
 			if (test.find("launcher") != std::string::npos) {
 				launcherPanel = true;
 				logLines = { "cflaunch 7: listening", "ps5vkctl: command list", "cflaunch: listed 49 titles", "cflaunch: PPSA03541 played 5400 s (total 50400 s)" };
@@ -2270,6 +2512,9 @@ public:
 #endif
 		gridScroll = (float)(selected / gridCols);
 		startCoverLoader();
+		if (sortMode == 5) {
+			measureAll();
+		}
 #if defined(VK_EXAMPLE_PS5)
 		if (ps5.frameBudget) {
 			// A test run's picture has every cover: wait for them here
@@ -2293,15 +2538,22 @@ public:
 
 	// ---------------------------------------------------------------- layout
 
+	// Showcase: tall 3:4 covers turned only a little, side by side; Classic: square, steep
+	bool showcase() const { return settings.layout == 0 && !settings.grid; }
+	float sideAngleNow() const { return settings.angle >= 0 ? settings.angle : (settings.layout == 0 ? 32.0f : theme.sideAngle); }
+
 	// Where cover i stands, from its offset to the sliding position
 	glm::mat4 coverModel(float offset) const
 	{
 		const float a = std::abs(offset);
 		const float s = std::clamp(offset, -1.0f, 1.0f);
-		const float x = a < 1.0f ? offset * sideOffset : (offset > 0 ? 1.0f : -1.0f) * (sideOffset + (a - 1.0f) * sideSpacing);
-		const float z = (1.0f - std::min(a, 1.0f)) * centrePop;
+		const bool tall = showcase();
+		const float first = tall ? 0.84f : sideOffset, step = tall ? 0.67f : sideSpacing, pop = tall ? 0.48f : centrePop;
+		const float x = a < 1.0f ? offset * first : (offset > 0 ? 1.0f : -1.0f) * (first + (a - 1.0f) * step);
+		const float z = (1.0f - std::min(a, 1.0f)) * pop;
 		glm::mat4 m = glm::translate(glm::mat4(1.0f), glm::vec3(x, 0.0f, z));
-		return glm::rotate(m, glm::radians(-s * theme.sideAngle), glm::vec3(0.0f, 1.0f, 0.0f));
+		m = glm::rotate(m, glm::radians(-s * sideAngleNow()), glm::vec3(0.0f, 1.0f, 0.0f));
+		return tall ? glm::scale(m, glm::vec3(0.75f, 1.0f, 1.0f)) : m;
 	}
 
 	void updateCamera()
@@ -2381,7 +2633,7 @@ public:
 	}
 
 	// The settings lines, in order (the groups start at the first of each)
-	enum SettingId { S_RETURN, S_GRID, S_ART, S_THEME, S_MUSIC, S_SOUNDS, S_REFLECT, S_ANGLE, S_UPDATE_CHECK, S_UPDATE_SOURCE,
+	enum SettingId { S_RETURN, S_GRID, S_LAYOUT, S_ART, S_DRIVES, S_IMPORT, S_THEME, S_MUSIC, S_SOUNDS, S_REFLECT, S_ANGLE, S_UPDATE_CHECK, S_UPDATE_SOURCE,
 		S_CHECK_NOW, S_LAUNCHER, S_BACKUP, S_RESTORE, S_QUIT_WITH, S_QUIT, S_COUNT };
 
 	// Each settings line: its label and its value ("" for actions)
@@ -2391,20 +2643,23 @@ public:
 		static const char *quitShort[4] = { "OPTIONS + SHARE", "L1 + R1 + OPTIONS", "Hold CIRCLE", "Settings only" };
 		auto onOff = [](bool b) { return std::string(b ? "On" : "Off"); };
 		return {
-			{ "Return to Cover Flow after a game", onOff(settings.returnAfter) },
+			{ "Return to Cover Flow when a game closes", onOff(settings.returnAfter) },
 			{ "Grid view  (L3)", onOff(settings.grid) },
+			{ "Layout", settings.layout == 0 ? std::string("Showcase") : std::string("Classic") },
 			{ "Game artwork behind the covers", onOff(settings.artBackgrounds) },
+			{ "Free space", drivesText },
+			{ "Import covers and names from USB", importJob ? std::string("Importing...") : std::string("") },
 			{ "Theme", currentTheme() },
 			{ "Music volume", musicFrames.empty() ? std::string("No music in theme") : percent(volume) },
 			{ "Sounds", onOff(settings.sounds) },
 			{ "Reflections", percent(theme.reflection) },
-			{ "Cover angle", std::to_string((int)std::lround(theme.sideAngle)) + "\xC2\xB0" },
+			{ "Cover angle", std::to_string((int)std::lround(sideAngleNow())) + "\xC2\xB0" + (settings.angle < 0 ? "  (layout)" : "") },
 			{ "Check for updates on start", onOff(settings.updateCheck) },
 			{ "Update source", "github.com/" + settings.updateRepo },
 			{ "Check for updates now", "" },
 			{ "Launcher", launcherStatus },
-			{ "Back up settings to USB", "" },
-			{ "Restore settings from USB", "" },
+			{ "Back up to USB", "" },
+			{ "Backups on USB and restore", "" },
 			{ "Quit with", quitShort[settings.quitWith] },
 			{ "Quit Cover Flow", "" },
 		};
@@ -2413,7 +2668,7 @@ public:
 	// Which settings lines change with LEFT / RIGHT
 	static bool settingAdjustable(int index)
 	{
-		return index <= S_ANGLE || index == S_UPDATE_CHECK || index == S_QUIT_WITH;
+		return (index <= S_ANGLE && index != S_DRIVES && index != S_IMPORT) || index == S_UPDATE_CHECK || index == S_QUIT_WITH;
 	}
 
 	// LEFT/RIGHT (delta) or CROSS (delta 0) on a settings line
@@ -2424,6 +2679,10 @@ public:
 		switch (index) {
 		case S_RETURN:
 			settings.returnAfter = !settings.returnAfter;
+			break;
+		case S_LAYOUT:
+			settings.layout = 1 - settings.layout;
+			showMessage(settings.layout == 0 ? "Showcase: tall covers, gently turned" : "Classic: square covers, steeply turned", 3.0f);
 			break;
 		case S_GRID:
 			settings.grid = !settings.grid;
@@ -2461,7 +2720,7 @@ public:
 			settings.reflection = std::clamp(std::round((theme.reflection + 0.1f * step) * 10.0f) / 10.0f, 0.0f, 1.0f);
 			break;
 		case S_ANGLE:
-			settings.angle = std::clamp(theme.sideAngle + 5.0f * step, 30.0f, 85.0f);
+			settings.angle = std::clamp(sideAngleNow() + 5.0f * step, 20.0f, 85.0f);
 			break;
 		case S_UPDATE_CHECK:
 			settings.updateCheck = !settings.updateCheck;
@@ -2481,13 +2740,21 @@ public:
 				openLauncherPanel();
 			}
 			return;
+		case S_DRIVES:
+			if (delta == 0) {
+				refreshDrives();
+			}
+			return;
+		case S_IMPORT:
+			if (delta == 0 && !importJob) {
+				importJob = askInBackground("import " + self, 120);
+				showMessage("Importing covers and names from USB...", 120.0f);
+			}
+			return;
 		case S_BACKUP:
 		case S_RESTORE:
-			if (delta == 0 && !toolJob) {
-				saveSettings();
-				toolRestore = index == S_RESTORE;
-				toolJob = askInBackground((toolRestore ? "restore " : "backup ") + self, 20);
-				showMessage(toolRestore ? "Restoring from USB..." : "Backing up to USB...", 20.0f);
+			if (delta == 0) {
+				openWizard(index == S_RESTORE);
 			}
 			return;
 		case S_QUIT_WITH:
@@ -2509,6 +2776,33 @@ public:
 
 	std::shared_ptr<Pending> toolJob, logJob;
 	bool toolRestore{ false };
+	std::shared_ptr<Pending> importJob, drivesJob;
+	std::string drivesText{ "-" };
+
+	void refreshDrives()
+	{
+		if (!drivesJob && listSource == "live") {
+			drivesJob = askInBackground("drives", 5);
+		}
+	}
+
+	// "ok drives Internal|free|total;USB 1|free|total" -> "Internal 24.3 GB free  ·  USB 1 1.20 TB free"
+	static std::string drivesSummary(const std::string &answer)
+	{
+		std::string out;
+		std::stringstream ss(trim(answer.substr(std::min(answer.size(), (size_t)9))));
+		std::string entry;
+		while (std::getline(ss, entry, ';')) {
+			std::stringstream es(entry);
+			std::string name, freeText, totalText;
+			if (!std::getline(es, name, '|') || !std::getline(es, freeText, '|')) {
+				continue;
+			}
+			const long long freeBytes = std::atoll(freeText.c_str());
+			out += (out.empty() ? "" : "  \xC2\xB7  ") + trim(name) + " " + formatSize(std::max(1LL, freeBytes)) + " free";
+		}
+		return out.empty() ? std::string("unknown") : out;
+	}
 	bool launcherPanel{ false };
 	std::vector<std::string> logLines;
 
@@ -2521,8 +2815,418 @@ public:
 		launcherStatus = running ? "running (version " + std::to_string(running) + ")" : "not running";
 	}
 
+	// ---------------------------------------------------------------- the backup wizard
+	// Back up and restore Cover Flow's own data (settings, favourites, collections,
+	// play time, your own covers and names) to a USB drive, one checked file at a
+	// time through the launcher. Games and system files are never touched.
+
+	enum WizardScreen { WZ_NONE, WZ_DRIVES, WZ_CONFIRM, WZ_PROGRESS, WZ_DONE, WZ_ERROR, WZ_MANAGE, WZ_RESTORE_CONFIRM };
+	struct UsbDrive {
+		std::string id, label, state; // state: none, complete, incomplete, old
+		long long freeBytes{ 0 }, totalBytes{ 0 }, date{ 0 }, covers{ 0 }, names{ 0 }, seconds{ 0 };
+		bool restorable() const { return state == "complete" || state == "old"; }
+	};
+	struct WizardJob {
+		std::mutex mutex;
+		int done{ 0 }, total{ 0 }, copied{ 0 };
+		long long bytes{ 0 };
+		std::string stage, error;
+		bool finished{ false };
+		std::atomic<bool> cancel{ false };
+	};
+	WizardScreen wizard{ WZ_NONE };
+	bool wizardRestore{ false };          // the job is a restore, not a backup
+	std::vector<UsbDrive> usbDrives;
+	std::shared_ptr<Pending> usbJob;      // "backups" being asked
+	bool usbLoading{ false };
+	int wizardFocus{ 0 };                 // the focused card or button on the screen
+	int wizardDrive{ -1 };                // the chosen drive
+	std::shared_ptr<WizardJob> wizardJob;
+	float wizardStarted{ 0.0f }, wizardEnded{ 0.0f };
+	std::string wizardResult;             // the done / error text
+	float wizardAnim{ 0.0f };
+
+	void openWizard(bool manage)
+	{
+		wizard = manage ? WZ_MANAGE : WZ_DRIVES;
+		wizardFocus = 0;
+		wizardDrive = -1;
+		settingsOpen = false;
+		refreshUsb();
+		playSound(1);
+	}
+
+	void refreshUsb()
+	{
+		if (!usbJob) {
+			usbJob = askInBackground("backups", 8);
+			usbLoading = true;
+		}
+	}
+
+	static std::vector<UsbDrive> parseUsb(const std::string &answer)
+	{
+		std::vector<UsbDrive> list;
+		if (answer.rfind("ok backups", 0) != 0) {
+			return list;
+		}
+		std::stringstream ss(trim(answer.substr(10)));
+		std::string entry;
+		while (std::getline(ss, entry, ';')) {
+			std::vector<std::string> f;
+			std::stringstream es(entry);
+			std::string field;
+			while (std::getline(es, field, '|')) {
+				f.push_back(trim(field));
+			}
+			if (f.size() < 8 || f[0].size() != 4) {
+				continue;
+			}
+			UsbDrive d;
+			d.id = f[0];
+			d.label = "USB " + std::to_string(f[0][3] - '0' + 1);
+			d.freeBytes = std::atoll(f[1].c_str());
+			d.totalBytes = std::atoll(f[2].c_str());
+			d.state = f[3];
+			d.date = std::atoll(f[4].c_str());
+			d.covers = std::atoll(f[5].c_str());
+			d.names = std::atoll(f[6].c_str());
+			d.seconds = std::atoll(f[7].c_str());
+			list.push_back(d);
+		}
+		return list;
+	}
+
+	// What a backup takes: (name inside the backup, bytes or -1 if the size is not known here)
+	std::vector<std::pair<std::string, long long>> backupItems(int &covers, int &names)
+	{
+		std::vector<std::pair<std::string, long long>> items;
+		auto size = [](const std::string &path) {
+			struct stat st {};
+			return stat(path.c_str(), &st) == 0 ? (long long)st.st_size : -1LL;
+		};
+		items.push_back({ "coverflow.ini", size(appRoot() + "coverflow.ini") });
+		if (size(appRoot() + "covers/games.txt") > 0) {
+			items.push_back({ "games.txt", size(appRoot() + "covers/games.txt") });
+		}
+		items.push_back({ "playtime.txt", -1 });
+		covers = 0;
+		names = (int)readNames(customDir() + "names.txt").size();
+		if (names > 0) {
+			items.push_back({ "custom/names.txt", size(customDir() + "names.txt") });
+		}
+		if (DIR *dir = opendir(customDir().c_str())) {
+			for (dirent *e; (e = readdir(dir)) != nullptr;) {
+				const std::string name = e->d_name;
+				const size_t dot = name.find('.');
+				const std::string ext = dot == std::string::npos ? "" : name.substr(dot);
+				if (dot == 9 && isTitleId(name.substr(0, 9)) && (ext == ".png" || ext == ".jpg" || ext == ".jpeg")) {
+					items.push_back({ "custom/" + name, size(customDir() + name) });
+					covers++;
+				}
+			}
+			closedir(dir);
+		}
+		return items;
+	}
+
+	void startBackup()
+	{
+		const UsbDrive &d = usbDrives[wizardDrive];
+		saveSettings();
+		int covers = 0, names = 0;
+		const auto items = backupItems(covers, names);
+		auto job = std::make_shared<WizardJob>();
+		job->total = (int)items.size() + 2;
+		job->stage = "Preparing " + d.label;
+		wizardJob = job;
+		wizardRestore = false;
+		wizard = WZ_PROGRESS;
+		wizardStarted = clock;
+		const std::string self = ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId, drive = d.id;
+		std::thread([job, items, self, drive, covers, names]() {
+			auto fail = [&](const std::string &why) {
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->error = why;
+				job->finished = true;
+			};
+			std::string answer = trim(askLauncher("backup-begin " + self + " " + drive, 4096, 20));
+			if (answer.rfind("ok", 0) != 0) {
+				return fail(answer.empty() ? "The launcher did not answer" : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0));
+			}
+			{
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->done = 1;
+			}
+			for (const auto &[item, bytes] : items) {
+				if (job->cancel) {
+					return fail("cancelled");
+				}
+				{
+					std::lock_guard<std::mutex> lock(job->mutex);
+					job->stage = "Copying " + item;
+				}
+				answer = trim(askLauncher("backup-file " + self + " " + drive + " " + item, 4096, 60));
+				if (answer.rfind("ok ", 0) != 0) {
+					// Only the settings must be there: a file that is gone (no play time
+					// yet, a cover removed meanwhile) is left out, not a failure
+					if (item != "coverflow.ini" && answer.find("cannot read") != std::string::npos) {
+						std::lock_guard<std::mutex> lock(job->mutex);
+						job->done++;
+						continue;
+					}
+					return fail(answer.empty() ? "The launcher did not answer" : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0));
+				}
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->bytes += std::atoll(answer.c_str() + 3);
+				job->copied++;
+				job->done++;
+			}
+			{
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->stage = "Checking and finishing";
+			}
+			answer = trim(askLauncher("backup-finish " + self + " " + drive + " " + std::to_string(covers) + " " + std::to_string(names), 4096, 20));
+			if (answer.rfind("ok", 0) != 0) {
+				return fail(answer.empty() ? "The launcher did not answer" : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0));
+			}
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = job->total;
+			job->finished = true;
+		}).detach();
+	}
+
+	void startRestore()
+	{
+		const UsbDrive &d = usbDrives[wizardDrive];
+		auto job = std::make_shared<WizardJob>();
+		job->total = 2;
+		job->stage = "Reading the backup on " + d.label;
+		wizardJob = job;
+		wizardRestore = true;
+		wizard = WZ_PROGRESS;
+		wizardStarted = clock;
+		const std::string self = ownTitleId.empty() ? std::string("PPSA99123") : ownTitleId, drive = d.id;
+		std::thread([job, self, drive]() {
+			auto fail = [&](const std::string &why) {
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->error = why;
+				job->finished = true;
+			};
+			std::string answer = trim(askLauncher("backup-files " + drive, 1u << 20, 20));
+			if (answer.rfind("ok files", 0) != 0) {
+				return fail(answer.empty() ? "The launcher did not answer" : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0));
+			}
+			std::vector<std::string> items;
+			std::stringstream ss(trim(answer.substr(8)));
+			std::string item;
+			while (std::getline(ss, item, ';')) {
+				if (!trim(item).empty()) {
+					items.push_back(trim(item));
+				}
+			}
+			if (items.empty()) {
+				return fail("The backup is empty");
+			}
+			{
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->total = (int)items.size() + 2;
+				job->done = 1;
+			}
+			for (const std::string &it : items) {
+				if (job->cancel) {
+					return fail("cancelled");
+				}
+				{
+					std::lock_guard<std::mutex> lock(job->mutex);
+					job->stage = "Restoring " + it;
+				}
+				answer = trim(askLauncher("restore-file " + self + " " + drive + " " + it, 4096, 60));
+				if (answer.rfind("ok ", 0) != 0) {
+					return fail(answer.empty() ? "The launcher did not answer" : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0));
+				}
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->bytes += std::atoll(answer.c_str() + 3);
+				job->copied++;
+				job->done++;
+			}
+			{
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->stage = "Finishing";
+			}
+			// Copied as root: give the files back to Cover Flow
+			(void)askLauncher("fixperms " + self, 4096, 20);
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = job->total;
+			job->finished = true;
+		}).detach();
+	}
+
+	void pollWizard()
+	{
+		std::string answer;
+		if (finished(usbJob, answer)) {
+			usbJob.reset();
+			usbLoading = false;
+			usbDrives = parseUsb(answer);
+			wizardFocus = 0;
+		}
+		if (wizard == WZ_PROGRESS && wizardJob) {
+			bool done;
+			std::string error;
+			long long bytes;
+			int files;
+			{
+				std::lock_guard<std::mutex> lock(wizardJob->mutex);
+				done = wizardJob->finished;
+				error = wizardJob->error;
+				bytes = wizardJob->bytes;
+				files = wizardJob->copied;
+			}
+			if (done) {
+				wizardEnded = clock;
+				wizardFocus = 0;
+				const UsbDrive &d = usbDrives[wizardDrive];
+				if (error == "cancelled") {
+					wizard = WZ_ERROR;
+					wizardResult = wizardRestore ? "Restore cancelled. Some of Cover Flow's files may already have been replaced; run the restore again to finish it."
+						: "Backup cancelled. The backup on " + d.label + " is marked incomplete and will not be offered for restore.";
+				} else if (!error.empty()) {
+					wizard = WZ_ERROR;
+					wizardResult = error;
+					playSound(3);
+				} else {
+					wizard = WZ_DONE;
+					const std::string size = formatSize(std::max(1LL, bytes));
+					wizardResult = wizardRestore
+						? "Restored " + std::to_string(files) + " files from " + d.label + ". Cover Flow will close - open it again to use them."
+						: "Backed up " + std::to_string(files) + (files == 1 ? " file (" : " files (") + size + ") to " + d.label + ". Every copy was read back and checked.";
+					playSound(1);
+					if (wizardRestore) {
+						restoredRestart = true;
+						closeAfterUpdate = 6.0f;
+					}
+				}
+				wizardJob.reset();
+				refreshUsb();
+			}
+		}
+	}
+
+	// The focusable things on each screen, in order: drive cards first, then buttons
+	std::vector<std::string> wizardButtons() const
+	{
+		switch (wizard) {
+		case WZ_DRIVES: return { usbDrives.empty() ? "Look again" : "Next  >", "Cancel" };
+		case WZ_CONFIRM: return { "Start backup", "Back" };
+		case WZ_PROGRESS: return { "Cancel" };
+		case WZ_DONE: return wizardRestore ? std::vector<std::string>{ "Close" } : std::vector<std::string>{ "Done", "Manage backups" };
+		case WZ_ERROR: return { "Try again", "Close" };
+		case WZ_MANAGE: return { "Restore", "Close" };
+		case WZ_RESTORE_CONFIRM: return { "Restore now", "Back" };
+		default: return {};
+		}
+	}
+	int wizardCards() const { return (wizard == WZ_DRIVES || wizard == WZ_MANAGE) ? (int)usbDrives.size() : 0; }
+
+#if defined(VK_EXAMPLE_PS5)
+	void wizardInput(const struct pad &p)
+	{
+		const int cards = wizardCards(), count = cards + (int)wizardButtons().size();
+		if (count > 0 && (p.pressed & (PAD_DOWN | PAD_RIGHT))) {
+			wizardFocus = (wizardFocus + 1) % count;
+			playSound(0);
+		}
+		if (count > 0 && (p.pressed & (PAD_UP | PAD_LEFT))) {
+			wizardFocus = (wizardFocus + count - 1) % count;
+			playSound(0);
+		}
+		if (wizardFocus < cards) {
+			wizardDrive = wizardFocus; // the focused card is the chosen drive
+		}
+		const bool back = p.pressed & PAD_CIRCLE;
+		if (!(p.pressed & PAD_CROSS) && !back) {
+			return;
+		}
+		circleHeld = -10.0f;
+		const std::vector<std::string> buttons = wizardButtons();
+		std::string action = back ? "back" : (wizardFocus >= cards && wizardFocus - cards < (int)buttons.size() ? buttons[wizardFocus - cards] : "card");
+		switch (wizard) {
+		case WZ_DRIVES:
+			if (action == "back" || action == "Cancel") {
+				wizard = WZ_NONE;
+			} else if (action == "Look again") {
+				refreshUsb();
+			} else if (wizardDrive >= 0 && wizardDrive < (int)usbDrives.size()) {
+				wizard = WZ_CONFIRM;
+				wizardFocus = 0;
+			}
+			break;
+		case WZ_CONFIRM:
+			if (action == "Start backup") {
+				startBackup();
+				wizardFocus = 0;
+			} else {
+				wizard = WZ_DRIVES;
+				wizardFocus = std::max(0, wizardDrive);
+			}
+			break;
+		case WZ_PROGRESS:
+			if (wizardJob) {
+				wizardJob->cancel = true;
+				std::lock_guard<std::mutex> lock(wizardJob->mutex);
+				wizardJob->stage = "Stopping after this file...";
+			}
+			break;
+		case WZ_DONE:
+			if (action == "Manage backups") {
+				wizard = WZ_MANAGE;
+				wizardFocus = std::max(0, wizardDrive);
+			} else {
+				wizard = WZ_NONE;
+			}
+			break;
+		case WZ_ERROR:
+			if (action == "Try again") {
+				wizard = wizardRestore ? WZ_RESTORE_CONFIRM : WZ_CONFIRM;
+				wizardFocus = 0;
+			} else {
+				wizard = WZ_NONE;
+			}
+			break;
+		case WZ_MANAGE:
+			if (action == "back" || action == "Close") {
+				wizard = WZ_NONE;
+			} else if (wizardDrive >= 0 && wizardDrive < (int)usbDrives.size()) {
+				if (usbDrives[wizardDrive].restorable()) {
+					wizard = WZ_RESTORE_CONFIRM;
+					wizardFocus = 0;
+				} else {
+					showMessage(usbDrives[wizardDrive].state == "incomplete" ? "That backup did not finish - back up again first" : "No Cover Flow backup on " + usbDrives[wizardDrive].label, 3.5f);
+					playSound(3);
+				}
+			}
+			break;
+		case WZ_RESTORE_CONFIRM:
+			if (action == "Restore now") {
+				startRestore();
+				wizardFocus = 0;
+			} else {
+				wizard = WZ_MANAGE;
+				wizardFocus = std::max(0, wizardDrive);
+			}
+			break;
+		default:
+			wizard = WZ_NONE;
+		}
+		playSound(back ? 2 : 1);
+	}
+
+#endif
+
 	void pollTools()
 	{
+		pollWizard();
 		std::string answer;
 		if (finished(toolJob, answer)) {
 			toolJob.reset();
@@ -2537,6 +3241,24 @@ public:
 				}
 			} else {
 				showMessage((toolRestore ? "Restore: " : "Backup: ") + (answer.empty() ? std::string("the launcher did not answer") : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0)), 5.0f);
+				playSound(3);
+			}
+		}
+		if (finished(drivesJob, answer)) {
+			drivesJob.reset();
+			drivesText = answer.rfind("ok drives", 0) == 0 ? drivesSummary(answer) : std::string("unknown");
+		}
+		if (finished(importJob, answer)) {
+			importJob.reset();
+			if (answer.rfind("ok import", 0) == 0) {
+				int covers = 0, names = 0;
+				std::sscanf(answer.c_str(), "ok import %d %d", &covers, &names);
+				applyImported();
+				auto count = [](int n, const char *one) { return std::to_string(n) + " " + one + (n == 1 ? "" : "s"); };
+				showMessage("Imported " + count(covers, "cover") + " and " + count(names, "name") + " from USB", 5.0f);
+				playSound(1);
+			} else {
+				showMessage("Import: " + (answer.empty() ? std::string("the launcher did not answer") : answer.substr(answer.rfind("err ", 0) == 0 ? 4 : 0)), 6.0f);
 				playSound(3);
 			}
 		}
@@ -2757,7 +3479,7 @@ public:
 
 	// The update, from inside Cover Flow: every file SHA256SUMS lists, each
 	// checked; only when all match are they put in place. "ok <tag> <n>" or "err ..."
-	static std::string appApply(const std::string &repo, const std::string &root)
+	static std::string appApply(const std::string &repo, const std::string &root, const std::string &self)
 	{
 		std::string tag, json, error, sums;
 		if (!latestRelease(repo, tag, json, error)) {
@@ -2816,6 +3538,21 @@ public:
 				return "err " + files[i].first + ": " + (status != 200 ? "could not download it" : "SHA-256 does not match") +
 					" - nothing was changed";
 			}
+		}
+		// Files written from here come out -rw-rw-rw- and owned by the app, and the
+		// console will not start an eboot.bin like that (CE-107750-0, v13 and v15).
+		// Make them what an FTP upload makes them, through the launcher (it runs as
+		// root), and check before anything is replaced.
+		for (const auto &f : files) {
+			chmod((root + f.first + ".new").c_str(), 0777);
+		}
+		const std::string fixed = trim(askLauncher("fixperms " + self, 4096, 20));
+		struct stat st {};
+		const bool runnable = stat((root + "eboot.bin.new").c_str(), &st) == 0 && (st.st_mode & 0111) != 0 && st.st_uid == 0;
+		if (!runnable) {
+			removeNew(files.size());
+			return "err the new eboot.bin could not be made startable (" + (fixed.empty() ? std::string("no answer from the launcher") : fixed) +
+				") - nothing was changed";
 		}
 		for (const auto &f : files) {
 			if (std::rename((root + f.first + ".new").c_str(), (root + f.first).c_str()) != 0) {
@@ -2923,9 +3660,9 @@ public:
 			updateApplyJob = askInBackground("update-apply " + settings.updateRepo + " " + self, 600);
 		} else {
 			auto job = std::make_shared<Pending>();
-			const std::string repo = settings.updateRepo, root = appRoot();
-			std::thread([job, repo, root]() {
-				const std::string answer = appApply(repo, root);
+			const std::string repo = settings.updateRepo, root = appRoot(), selfId = self;
+			std::thread([job, repo, root, selfId]() {
+				const std::string answer = appApply(repo, root, selfId);
 				std::lock_guard<std::mutex> lock(job->mutex);
 				job->answer = answer;
 				job->done = true;
@@ -2958,6 +3695,38 @@ public:
 			out += id + " " + std::to_string(bytes) + "\n";
 		}
 		writeFile(appRoot() + "covers/auto/sizes.txt", out);
+	}
+
+	// Measure every game not measured yet, one after another in the background
+	// (for "Largest first"); sizes are kept in covers/auto/sizes.txt after that
+	void measureAll()
+	{
+		if (measuringAll || listSource != "live") {
+			return;
+		}
+		std::vector<std::string> ids;
+		for (const Game &g : games) {
+			if (!g.titleId.empty() && g.bytes == 0 && !sizePending.count(g.titleId)) {
+				ids.push_back(g.titleId);
+				sizePending.insert(g.titleId);
+			}
+		}
+		if (ids.empty()) {
+			return;
+		}
+		measuringAll = true;
+		showMessage("Measuring " + std::to_string(ids.size()) + " games for Largest first...", 4.0f);
+		std::shared_ptr<SizeResults> results = sizeResults;
+		std::thread([results, ids]() {
+			for (const std::string &id : ids) {
+				const std::string answer = trim(askLauncher("size " + id, 4096, 30));
+				const long long bytes = answer.rfind("ok ", 0) == 0 ? std::atoll(answer.c_str() + 3) : -1;
+				std::lock_guard<std::mutex> lock(results->mutex);
+				results->done[id] = bytes;
+			}
+			std::lock_guard<std::mutex> lock(results->mutex);
+			results->batches++;
+		}).detach();
 	}
 
 	// Ask the launcher for a game's size without holding up the frame
@@ -3006,11 +3775,15 @@ public:
 
 	std::vector<std::string> menuItems(const Game &g) const
 	{
-		return { "Start game", isFavourite(g) ? "Remove from favourites" : "Add to favourites",
+		std::vector<std::string> items = { "Play Game", isFavourite(g) ? "Remove from Favourites" : "Add to Favourites",
+			"Add to Collection  (" + collectionSummary(g) + ")",
 			"Category:  " + categoryName(g.section) + (sectionOverride.count(g.titleId) ? "" : "  (automatic)"),
-			"Collections:  " + collectionSummary(g),
-			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow",
-			"Dump Game / App", "Close" };
+			isHidden(g) ? "Show in Cover Flow" : "Hide from Cover Flow" };
+		if (g.renamed || g.customCover) {
+			items.push_back("Use the Original Name and Cover");
+		}
+		items.push_back("Settings");
+		return items;
 	}
 
 	std::string collectionSummary(const Game &g) const
@@ -3049,8 +3822,19 @@ public:
 			return;
 		}
 		const std::string id = g->titleId, name = g->title;
-		const Game *gp = g;
-		(void)gp;
+		// The line chosen decides the action (the list changes with the game)
+		const std::vector<std::string> items = menuItems(*g);
+		const std::string label = index >= 0 && index < (int)items.size() ? items[index] : "";
+		if (label == "Settings") {
+			menuOpen = false;
+			settingsOpen = true;
+			settingsIndex = 0;
+			refreshDrives();
+			return;
+		}
+		index = label == "Play Game" ? 0 : label.find("Favourites") != std::string::npos ? 1 : label.rfind("Category", 0) == 0 ? 2
+			: label.rfind("Add to Collection", 0) == 0 ? 3 : label.find("in Cover Flow") != std::string::npos || label.find("from Cover Flow") != std::string::npos ? 4
+			: label.rfind("Use the Original", 0) == 0 ? 5 : -1;
 		switch (index) {
 		case 0:
 			menuOpen = false;
@@ -3102,16 +3886,63 @@ public:
 			rebuildView();
 			break;
 		case 5:
-			dumpOpen = true;
-			dumpIndex = 0;
-			dumpDestination = 0;
-			dumpStage = 0;
-			dumpProgress = 0.0f;
+			if (g->renamed || g->customCover) {
+				resetCustom(view[selected]);
+				break;
+			}
+			menuOpen = false;
 			break;
 		default:
 			menuOpen = false;
 			break;
 		}
+	}
+
+	// Back to the console's name and the game icon: Cover Flow's override files go
+	void resetCustom(int index)
+	{
+		Game &g = games[index];
+		auto names = readNames(customDir() + "names.txt");
+		if (names.erase(g.titleId)) {
+			writeNames(names);
+		}
+		for (const char *ext : { ".png", ".jpg", ".jpeg", ".PNG", ".JPG" }) {
+			std::remove((customDir() + g.titleId + ext).c_str());
+		}
+		const bool hadCover = g.customCover;
+		applyCustom(g, names);
+		if (g.customCover) {
+			showMessage("Could not remove the cover file for " + g.title, 4.0f);
+			playSound(3);
+			return;
+		}
+		if (hadCover) {
+			g.reload = g.loaded;
+			startCoverLoader({ index });
+		}
+		menuOpen = false;
+		rebuildView();
+		showMessage(g.title + ": original name and cover", 3.0f);
+	}
+
+	// After an import: new names and covers onto the games already shown
+	void applyImported()
+	{
+		const auto names = loadCustomNames();
+		std::vector<int> recover;
+		for (int i = 0; i < (int)games.size(); i++) {
+			Game &g = games[i];
+			const std::string before = g.customPath;
+			applyCustom(g, names);
+			if (g.customPath != before || g.customCover) {
+				g.reload = g.loaded;
+				recover.push_back(i);
+			}
+		}
+		if (!recover.empty()) {
+			startCoverLoader(recover);
+		}
+		rebuildView();
 	}
 
 	// The letter a game is filed under: A-Z, or # for the rest
@@ -3209,6 +4040,119 @@ public:
 		}
 	}
 
+	// The key under the focus on the bottom row (Space, Delete, Clear, Done)
+	int searchBottomKey() const
+	{
+		for (int k = 3; k >= 0; k--) {
+			if (searchCol >= searchBottom[k].from) {
+				return k;
+			}
+		}
+		return 0;
+	}
+
+	void openSearch()
+	{
+		searchOpen = true;
+		menuOpen = false;
+		searchRow = 1;
+		searchCol = 0;
+		playSound(1);
+	}
+
+	void closeSearch()
+	{
+		searchOpen = false;
+		circleHeld = -10.0f;
+		playSound(2);
+		if (!searchQuery.empty()) {
+			showMessage(std::to_string(view.size()) + (view.size() == 1 ? " game" : " games") + " found - CIRCLE clears the search", 3.0f);
+		}
+	}
+
+	// Types the key under the focus
+	void searchPress()
+	{
+		if (searchRow < 4) {
+			if ((int)searchQuery.size() < searchMaxLength) {
+				searchQuery += (char)std::tolower((unsigned char)searchRows[searchRow][searchCol]);
+				searchChanged();
+			}
+			playSound(0);
+			return;
+		}
+		switch (searchBottomKey()) {
+		case 0:
+			if (!searchQuery.empty() && searchQuery.back() != ' ' && (int)searchQuery.size() < searchMaxLength) {
+				searchQuery += ' ';
+			}
+			playSound(0);
+			break;
+		case 1:
+			if (!searchQuery.empty()) {
+				searchQuery.pop_back();
+				searchChanged();
+			}
+			playSound(0);
+			break;
+		case 2:
+			if (!searchQuery.empty()) {
+				searchQuery.clear();
+				searchChanged();
+			}
+			playSound(0);
+			break;
+		default:
+			closeSearch();
+			break;
+		}
+	}
+
+#if defined(VK_EXAMPLE_PS5)
+	void searchInput(const struct pad &p, bool optionsTap)
+	{
+		if (p.pressed & PAD_UP) {
+			searchRow = (searchRow + 4) % 5;
+			playSound(0);
+		}
+		if (p.pressed & PAD_DOWN) {
+			searchRow = (searchRow + 1) % 5;
+			playSound(0);
+		}
+		if (p.pressed & (PAD_LEFT | PAD_RIGHT)) {
+			const int step = (p.pressed & PAD_LEFT) ? -1 : 1;
+			if (searchRow == 4) {
+				searchCol = searchBottom[(searchBottomKey() + 4 + step) % 4].from;
+			} else {
+				searchCol = (searchCol + searchCols + step) % searchCols;
+			}
+			playSound(0);
+		}
+		if (p.pressed & PAD_CROSS) {
+			searchPress();
+		}
+		if ((p.pressed & PAD_SQUARE) && !searchQuery.empty()) {
+			searchQuery.pop_back();
+			searchChanged();
+			playSound(0);
+		}
+		if ((p.pressed & PAD_TRIANGLE) && !searchQuery.empty() && searchQuery.back() != ' ' && (int)searchQuery.size() < searchMaxLength) {
+			searchQuery += ' ';
+			playSound(0);
+		}
+		// L1 / R1 browse the matches without leaving the keyboard
+		if (p.pressed & PAD_L1) {
+			move(-1);
+		}
+		if (p.pressed & PAD_R1) {
+			move(1);
+		}
+		if ((p.pressed & (PAD_CIRCLE | PAD_R3)) || optionsTap) {
+			closeSearch();
+		}
+	}
+#endif
+
 	void handleInput(float dt)
 	{
 		if (closeAfterUpdate > 0.0f) {
@@ -3263,6 +4207,10 @@ public:
 			}
 			return;
 		}
+		if (wizard != WZ_NONE) {
+			wizardInput(p);
+			return;
+		}
 		if (launcherPanel) {
 			if (p.pressed & PAD_CROSS) {
 				ensureLauncher(true);
@@ -3302,11 +4250,21 @@ public:
 			}
 			return;
 		}
+		if (searchOpen) {
+			searchInput(p, optionsTap);
+			return;
+		}
+		// R3: search
+		if ((p.pressed & PAD_R3) && !menuOpen) {
+			openSearch();
+			return;
+		}
 		if (optionsTap) {
 			playSound(1);
 			settingsOpen = true;
 			menuOpen = false;
 			settingsIndex = 0;
+			refreshDrives();
 			return;
 		}
 		// L3: the grid, or the row
@@ -3395,9 +4353,13 @@ public:
 			rebuildView();
 			saveSettings();
 			showMessage(std::string("Sorted by ") + sortNames[sortMode], 2.0f);
+			if (sortMode == 5) {
+				measureAll();
+			}
 		}
 		if (p.pressed & PAD_TOUCH_PAD) {
-			// The next filter, skipping collections nothing is in
+			// The next filter, skipping collections nothing is in (a search gives way to it)
+			searchQuery.clear();
 			do {
 				filterMode = (filterMode + 1) % filterCount;
 			} while (filterMode >= baseFilters && !collectionUsed(filterMode - baseFilters));
@@ -3411,68 +4373,12 @@ public:
 			menuIndex = 0;
 			categoryOpen = false;
 			collectionsOpen = false;
-			dumpOpen = false;
 			playSound(menuOpen ? 1 : 2);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
 		}
-		if (menuOpen && dumpOpen) {
-			// The preview deliberately simulates progress only; it never touches game files.
-			if (dumpStage == 2) {
-				dumpProgress = std::min(1.0f, dumpProgress + dt * 0.35f);
-				if (dumpProgress >= 1.0f) {
-					dumpStage = 3;
-					dumpIndex = 0;
-				}
-			}
-			const int dumpItemCount = dumpStage == 0 ? 4 : (dumpStage == 1 || dumpStage == 3 ? 2 : 0);
-			if (dumpItemCount > 0 && (p.pressed & PAD_UP)) {
-				dumpIndex = (dumpIndex + dumpItemCount - 1) % dumpItemCount;
-			}
-			if (dumpItemCount > 0 && (p.pressed & PAD_DOWN)) {
-				dumpIndex = (dumpIndex + 1) % dumpItemCount;
-			}
-			if (p.pressed & PAD_CROSS) {
-				if (dumpStage == 0) {
-					if (dumpIndex < 2) {
-						dumpDestination = dumpIndex;
-						showMessage(dumpDestination == 0 ? "Destination: internal storage" : "Destination: USB drive", 2.0f);
-					} else if (dumpIndex == 2) {
-						dumpStage = 1;
-						dumpIndex = 0;
-					} else {
-						dumpOpen = false;
-						circleHeld = -10.0f;
-					}
-				} else if (dumpStage == 1) {
-					if (dumpIndex == 0) {
-						dumpStage = 2;
-						dumpProgress = 0.0f;
-					} else {
-						dumpStage = 0;
-						dumpIndex = 0;
-					}
-				} else if (dumpStage == 3) {
-					if (dumpIndex == 0) {
-						dumpStage = 0;
-						dumpIndex = 0;
-					} else {
-						dumpOpen = false;
-						circleHeld = -10.0f;
-					}
-				}
-			}
-			if (p.pressed & PAD_CIRCLE) {
-				if (dumpStage == 1 || dumpStage == 3) {
-					dumpStage = 0;
-					dumpIndex = 0;
-				} else {
-					dumpOpen = false;
-				}
-				circleHeld = -10.0f;
-			}
-		} else if (menuOpen && collectionsOpen) {
+		if (menuOpen && collectionsOpen) {
 			if (p.pressed & PAD_UP) {
 				collectionIndex = (collectionIndex + collectionCount - 1) % collectionCount;
 			}
@@ -3517,6 +4423,13 @@ public:
 		if ((p.pressed & PAD_CIRCLE) && menuOpen && circleHeld > -5.0f) {
 			menuOpen = false;
 			circleHeld = -10.0f; // this press closed the menu: it does not count towards quitting
+		} else if ((p.pressed & PAD_CIRCLE) && !menuOpen && !searchQuery.empty()) {
+			// CIRCLE clears a search (and does not count towards quitting)
+			searchQuery.clear();
+			rebuildView();
+			circleHeld = -10.0f;
+			showMessage(std::string("Search cleared - showing ") + filterName(filterMode), 2.0f);
+			playSound(2);
 		}
 		circleHeld = (p.held & PAD_CIRCLE) ? circleHeld + dt : 0.0f;
 		if (settings.quitWith == 2 && circleHeld > 2.0f) {
@@ -3562,7 +4475,7 @@ public:
 			layer.mvp[0][0] = 2.0f;
 			layer.mvp[0][1] = a->aspect / ((float)width / (float)height);
 			layer.mvp[0][2] = 0.5f;
-			layer.mvp[0][3] = alpha * 0.85f;
+			layer.mvp[0][3] = alpha * (showcase() ? 0.5f : 0.85f); // Showcase keeps the blue glow showing
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.art);
 			vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &a->set, 0, nullptr);
 			vkCmdPushConstants(cmd, pipelineLayout, stages, 0, sizeof(layer), &layer);
@@ -3588,7 +4501,11 @@ public:
 			vkCmdDraw(cmd, 6, 1, 0, 0);
 		};
 		// Side covers a little darker, the far ones fading out
-		auto brightnessAt = [](float a) { return 1.0f - 0.40f * std::min(a, 1.0f) - 0.05f * std::max(0.0f, a - 1.0f); };
+		const bool tall = showcase();
+		auto brightnessAt = [tall](float a) {
+			return tall ? 1.0f - 0.16f * std::min(a, 1.0f) - 0.04f * std::max(0.0f, a - 1.0f) : 1.0f - 0.40f * std::min(a, 1.0f) - 0.05f * std::max(0.0f, a - 1.0f);
+		};
+		const float tallKind = tall ? 10.0f : 0.0f; // the shaders crop the square cover to 3:4
 		auto alphaAt = [](float a) { return std::clamp(8.5f - a, 0.0f, 1.0f); };
 
 		if (settings.grid) {
@@ -3632,7 +4549,7 @@ public:
 			for (int k : order) {
 				const float a = std::abs(k - position);
 				draw(glm::scale(coverModel(k - position), glm::vec3(1.0f, -1.0f, 1.0f)),
-					glm::vec4(theme.reflection, brightnessAt(a), alphaAt(a), 0.0f), coverSet(games[view[k]]));
+					glm::vec4(theme.reflection, brightnessAt(a), alphaAt(a), tallKind), coverSet(games[view[k]]));
 			}
 		}
 		for (int k : order) {
@@ -3656,7 +4573,7 @@ public:
 		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelines.cover);
 		for (int k : order) {
 			const float a = std::abs(k - position);
-			draw(coverModel(k - position), glm::vec4(0.0f, brightnessAt(a), alphaAt(a), (k == selected && a < 0.05f) ? 1.0f : 0.0f),
+			draw(coverModel(k - position), glm::vec4(0.0f, brightnessAt(a), alphaAt(a), tallKind + ((k == selected && a < 0.05f) ? 1.0f : 0.0f)),
 				coverSet(games[view[k]]));
 		}
 
@@ -3678,7 +4595,9 @@ public:
 		updateArt(dt);
 		auto ease = [dt](float &v, bool on) { v += ((on ? 1.0f : 0.0f) - v) * (1.0f - std::exp(-dt * 16.0f)); };
 		ease(menuAnim, menuOpen);
+		ease(wizardAnim, wizard != WZ_NONE);
 		ease(settingsAnim, settingsOpen);
+		ease(searchAnim, searchOpen);
 		ease(dialogAnim, updateDialog);
 		ease(loadingAnim, coversLoaded < (int)games.size());
 		handleInput(dt);
@@ -3702,6 +4621,22 @@ public:
 			quit = true;
 		}
 		collectSizes();
+		{
+			int batches;
+			{
+				std::lock_guard<std::mutex> lock(sizeResults->mutex);
+				batches = sizeResults->batches;
+			}
+			if (batches != sizeBatchesSeen) {
+				sizeBatchesSeen = batches;
+				measuringAll = false;
+				collectSizes(); // the last answers, in case they came in just now
+				if (sortMode == 5) {
+					rebuildView();
+					showMessage("Sorted by size", 2.0f);
+				}
+			}
+		}
 		pollUpdates(dt);
 		pollTools();
 		if (menuOpen && current()) {
@@ -3721,8 +4656,12 @@ public:
 			return "measuring...";
 		}
 		char s[32];
-		if (bytes >= (1ll << 30)) {
+		if (bytes >= (1ll << 40)) {
+			std::snprintf(s, sizeof(s), "%.2f TB", bytes / 1099511627776.0);
+		} else if (bytes >= (1ll << 30)) {
 			std::snprintf(s, sizeof(s), "%.1f GB", bytes / 1073741824.0);
+		} else if (bytes < (1ll << 20)) {
+			std::snprintf(s, sizeof(s), "%.0f KB", std::max(1.0, bytes / 1024.0));
 		} else {
 			std::snprintf(s, sizeof(s), bytes >= (10ll << 20) ? "%.0f MB" : "%.1f MB", bytes / 1048576.0);
 		}
@@ -3746,13 +4685,16 @@ public:
 
 	// ---------------------------------------------------------------- the interface
 
-	enum Glyph { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_OPTIONS, G_SHARE, G_TOUCHPAD, G_L1, G_R1, G_DPAD_LR, G_DPAD_UD, G_L2, G_R2, G_L3, G_RSTICK };
+	enum Glyph { G_CROSS, G_CIRCLE, G_TRIANGLE, G_SQUARE, G_OPTIONS, G_SHARE, G_TOUCHPAD, G_L1, G_R1, G_DPAD_LR, G_DPAD_UD, G_L2, G_R2, G_L3, G_R3, G_RSTICK };
 
 	// Everything on screen but the covers, drawn with ImGui's draw list
 	void OnUpdateUIOverlay(vks::UIOverlay *overlay) override
 	{
 		ImDrawList *dl = ImGui::GetOverlayDrawList();
 		ImFont *font = ImGui::GetFont();
+		// The bold face for headings and titles, when the overlay loaded one
+		ImFont *boldFont = ImGui::GetIO().Fonts->Fonts.Size > 1 ? ImGui::GetIO().Fonts->Fonts[1] : font;
+		ImFont *face = font;
 		const float s = height / 1080.0f;
 		const float W = (float)width, H = (float)height;
 		auto alphaOf = [](ImU32 c) { return (int)((c >> 24) & 0xFF); };
@@ -3760,13 +4702,19 @@ public:
 		const ImU32 white = IM_COL32(255, 255, 255, 255);
 		const ImU32 textC = theme.text, dimC = theme.dim;
 		const ImU32 accentC = IM_COL32((int)(theme.accent.r * 255), (int)(theme.accent.g * 255), (int)(theme.accent.b * 255), 255);
-		auto width_ = [&](const std::string &str, float size) { return font->CalcTextSizeA(size, FLT_MAX, 0.0f, str.c_str()).x; };
+		auto width_ = [&](const std::string &str, float size) { return face->CalcTextSizeA(size, FLT_MAX, 0.0f, str.c_str()).x; };
 		auto text = [&](const std::string &str, float size, float x, float y, ImU32 colour, float alignX = 0.0f, bool shadow = true) {
 			const float px = x - width_(str, size) * alignX;
 			if (shadow) {
-				dl->AddText(font, size, ImVec2(px + 1.5f * s, y + 2.0f * s), IM_COL32(0, 0, 0, alphaOf(colour) * 140 / 255), str.c_str());
+				dl->AddText(face, size, ImVec2(px + 1.5f * s, y + 2.0f * s), IM_COL32(0, 0, 0, alphaOf(colour) * 140 / 255), str.c_str());
 			}
-			dl->AddText(font, size, ImVec2(px, y), colour, str.c_str());
+			dl->AddText(face, size, ImVec2(px, y), colour, str.c_str());
+		};
+		// The same in the bold face
+		auto title = [&](const std::string &str, float size, float x, float y, ImU32 colour, float alignX = 0.0f, bool shadow = true) {
+			face = boldFont;
+			text(str, size, x, y, colour, alignX, shadow);
+			face = font;
 		};
 		// A string cut to a width, with an ellipsis
 		auto fit = [&](std::string str, float size, float maxW) {
@@ -3781,13 +4729,94 @@ public:
 			}
 			return str + "...";
 		};
+		// Deep navy panels with a soft blue edge and glow
 		auto panel = [&](float x, float y, float w, float h, float a) {
 			for (int i = 3; i >= 1; i--) {
-				const float g = i * 10.0f * s;
-				dl->AddRectFilled(ImVec2(x - g, y - g + 8.0f * s), ImVec2(x + w + g, y + h + g + 8.0f * s), IM_COL32(0, 0, 0, (int)(28 * a)), 22.0f * s + g);
+				const float g = i * 9.0f * s;
+				dl->AddRectFilled(ImVec2(x - g, y - g + 6.0f * s), ImVec2(x + w + g, y + h + g + 6.0f * s), IM_COL32(0, 0, 0, (int)(30 * a)), 22.0f * s + g);
 			}
-			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(16, 18, 26, (int)(246 * a)), 20.0f * s);
-			dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(255, 255, 255, (int)(26 * a)), 20.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+			for (int i = 2; i >= 1; i--) {
+				const float g = i * 3.0f * s;
+				dl->AddRect(ImVec2(x - g, y - g), ImVec2(x + w + g, y + h + g), withAlpha(accentC, a * 0.10f * (3 - i)), 20.0f * s + g, ImDrawCornerFlags_All, 3.0f * s);
+			}
+			const float r = 20.0f * s;
+			dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(13, 20, 34, (int)(248 * a)), r);
+			// A lighter band fading down from the top
+			dl->AddRectFilledMultiColor(ImVec2(x + r * 0.3f, y + 2.0f * s), ImVec2(x + w - r * 0.3f, y + std::min(h * 0.5f, 260.0f * s)),
+				IM_COL32(40, 70, 130, (int)(70 * a)), IM_COL32(40, 70, 130, (int)(70 * a)), IM_COL32(40, 70, 130, 0), IM_COL32(40, 70, 130, 0));
+			dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), withAlpha(accentC, a * 0.55f), r, ImDrawCornerFlags_All, 1.6f * s);
+		};
+		// A game's cover inside the overlay (its own texture; the placeholder until it has loaded)
+		auto cover = [&](const Game &g, float x, float y, float size, float a, float rounding) {
+			const VkDescriptorSet set = g.loaded && g.descriptorSet != VK_NULL_HANDLE ? g.descriptorSet : placeholderSet;
+			if (set == VK_NULL_HANDLE) {
+				return;
+			}
+			dl->AddImageRounded((ImTextureID)set, ImVec2(x, y), ImVec2(x + size, y + size), ImVec2(0, 0), ImVec2(1, 1), IM_COL32(255, 255, 255, (int)(255 * a)), rounding);
+		};
+		// Small line icons for menus
+		auto icon = [&](const std::string &kind, float cx, float cy, float r, ImU32 c) {
+			const float t = std::max(1.5f, r * 0.16f);
+			if (kind == "play") {
+				dl->AddTriangleFilled(ImVec2(cx - r * 0.55f, cy - r * 0.75f), ImVec2(cx - r * 0.55f, cy + r * 0.75f), ImVec2(cx + r * 0.8f, cy), c);
+			} else if (kind == "star") {
+				ImVec2 pts[10];
+				for (int i = 0; i < 10; i++) {
+					const float ang = -1.5708f + i * 0.6283f, rr = (i % 2) ? r * 0.42f : r;
+					pts[i] = ImVec2(cx + std::cos(ang) * rr, cy + std::sin(ang) * rr);
+				}
+				for (int i = 0; i < 10; i += 2) {
+					dl->AddTriangleFilled(ImVec2(cx, cy), pts[i], pts[(i + 1) % 10], c);
+					dl->AddTriangleFilled(ImVec2(cx, cy), pts[(i + 9) % 10], pts[i], c);
+				}
+			} else if (kind == "folder") {
+				dl->AddRectFilled(ImVec2(cx - r, cy - r * 0.6f), ImVec2(cx - r * 0.1f, cy - r * 0.2f), c, r * 0.15f);
+				dl->AddRectFilled(ImVec2(cx - r, cy - r * 0.35f), ImVec2(cx + r, cy + r * 0.75f), c, r * 0.15f);
+			} else if (kind == "tag") {
+				dl->AddRect(ImVec2(cx - r * 0.85f, cy - r * 0.85f), ImVec2(cx + r * 0.85f, cy + r * 0.85f), c, r * 0.3f, ImDrawCornerFlags_All, t);
+				dl->AddCircleFilled(ImVec2(cx - r * 0.3f, cy - r * 0.3f), r * 0.18f, c);
+			} else if (kind == "eye") {
+				dl->PathArcTo(ImVec2(cx, cy + r * 0.9f), r * 1.3f, -2.3f, -0.84f, 12);
+				dl->PathStroke(c, false, t);
+				dl->PathArcTo(ImVec2(cx, cy - r * 0.9f), r * 1.3f, 0.84f, 2.3f, 12);
+				dl->PathStroke(c, false, t);
+				dl->AddCircleFilled(ImVec2(cx, cy), r * 0.32f, c);
+			} else if (kind == "reset") {
+				dl->PathArcTo(ImVec2(cx, cy), r * 0.8f, -0.6f, 4.2f, 16);
+				dl->PathStroke(c, false, t);
+				dl->AddTriangleFilled(ImVec2(cx + r * 0.45f, cy - r * 0.95f), ImVec2(cx + r * 1.0f, cy - r * 0.35f), ImVec2(cx + r * 0.25f, cy - r * 0.25f), c);
+			} else if (kind == "info") {
+				dl->AddCircle(ImVec2(cx, cy), r * 0.9f, c, 24, t);
+				dl->AddLine(ImVec2(cx, cy - r * 0.1f), ImVec2(cx, cy + r * 0.45f), c, t * 1.3f);
+				dl->AddCircleFilled(ImVec2(cx, cy - r * 0.42f), t * 0.8f, c);
+			} else if (kind == "clock") {
+				dl->AddCircle(ImVec2(cx, cy), r * 0.9f, c, 24, t);
+				dl->AddLine(ImVec2(cx, cy), ImVec2(cx, cy - r * 0.55f), c, t);
+				dl->AddLine(ImVec2(cx, cy), ImVec2(cx + r * 0.4f, cy), c, t);
+			} else if (kind == "pad") {
+				dl->AddRectFilled(ImVec2(cx - r * 1.1f, cy - r * 0.5f), ImVec2(cx + r * 1.1f, cy + r * 0.45f), c, r * 0.45f);
+				dl->AddCircleFilled(ImVec2(cx - r * 0.75f, cy + r * 0.35f), r * 0.42f, c);
+				dl->AddCircleFilled(ImVec2(cx + r * 0.75f, cy + r * 0.35f), r * 0.42f, c);
+				const ImU32 hole = IM_COL32(12, 22, 46, 255);
+				dl->AddRectFilled(ImVec2(cx - r * 0.72f, cy - r * 0.08f), ImVec2(cx - r * 0.32f, cy + r * 0.04f), hole);
+				dl->AddRectFilled(ImVec2(cx - r * 0.58f, cy - r * 0.22f), ImVec2(cx - r * 0.46f, cy + r * 0.18f), hole);
+				dl->AddCircleFilled(ImVec2(cx + r * 0.52f, cy - r * 0.02f), r * 0.1f, hole);
+				dl->AddCircleFilled(ImVec2(cx + r * 0.72f, cy - r * 0.02f), r * 0.1f, hole);
+			} else if (kind == "search") {
+				dl->AddCircle(ImVec2(cx - r * 0.18f, cy - r * 0.18f), r * 0.62f, c, 24, t * 1.3f);
+				dl->AddLine(ImVec2(cx + r * 0.27f, cy + r * 0.27f), ImVec2(cx + r * 0.85f, cy + r * 0.85f), c, t * 1.8f);
+			} else if (kind == "gear") {
+				for (int i = 0; i < 8; i++) {
+					const float ang = i * 0.7854f;
+					const ImVec2 dir(std::cos(ang), std::sin(ang));
+					dl->AddLine(ImVec2(cx + dir.x * r * 0.55f, cy + dir.y * r * 0.55f), ImVec2(cx + dir.x * r, cy + dir.y * r), c, t * 1.9f);
+				}
+				dl->AddCircleFilled(ImVec2(cx, cy), r * 0.68f, c, 24);
+				dl->AddCircleFilled(ImVec2(cx, cy), r * 0.28f, IM_COL32(12, 22, 46, 255), 16);
+			} else { // close
+				dl->AddLine(ImVec2(cx - r * 0.6f, cy - r * 0.6f), ImVec2(cx + r * 0.6f, cy + r * 0.6f), c, t * 1.2f);
+				dl->AddLine(ImVec2(cx + r * 0.6f, cy - r * 0.6f), ImVec2(cx - r * 0.6f, cy + r * 0.6f), c, t * 1.2f);
+			}
 		};
 		// PlayStation button symbols, white in a soft disc, as the console's own menus draw them
 		auto glyph = [&](Glyph g, float cx, float cy, float r, float a) -> float {
@@ -3836,8 +4865,9 @@ public:
 			case G_L2:
 			case G_R2:
 			case G_L3:
+			case G_R3:
 			case G_RSTICK: {
-				const char *label = g == G_L1 ? "L1" : g == G_R1 ? "R1" : g == G_L2 ? "L2" : g == G_R2 ? "R2" : g == G_L3 ? "L3" : "R";
+				const char *label = g == G_L1 ? "L1" : g == G_R1 ? "R1" : g == G_L2 ? "L2" : g == G_R2 ? "R2" : g == G_L3 ? "L3" : g == G_R3 ? "R3" : "R";
 				const float size = r * 1.05f, w = width_(label, size) * 0.5f + r * 0.55f;
 				dl->AddRectFilled(ImVec2(cx - w, cy - r * 0.8f), ImVec2(cx + w, cy + r * 0.8f), bg, r * 0.35f);
 				text(label, size, cx, cy - size * 0.52f, fg, 0.5f, false);
@@ -3869,6 +4899,7 @@ public:
 				case G_L2:
 				case G_R2:
 				case G_L3:
+				case G_R3:
 				case G_RSTICK: return width_("L1", r * 1.05f) + 1.1f * r;
 				default: return 2.0f * r;
 				}
@@ -3913,18 +4944,35 @@ public:
 
 		// ---- the header: heading, filter and sort; count and where the library came from
 		const float margin = 72.0f * s;
-		text(theme.heading, 46.0f * s, margin, 44.0f * s, textC);
+		icon("pad", margin + 26.0f * s, 72.0f * s, 22.0f * s, withAlpha(accentC, 1.0f));
+		title(theme.heading, 44.0f * s, margin + 66.0f * s, 44.0f * s, textC);
 		float cx = margin;
 		const float chipY = 108.0f * s, chipSize = 20.0f * s;
-		cx += chip(filterName(filterMode), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
+		if (!searchQuery.empty()) {
+			cx += chip("Search: " + fit(searchQuery, chipSize, 420.0f * s), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
+		} else {
+			cx += chip(filterName(filterMode), cx, chipY, chipSize, withAlpha(accentC, 0.85f), white) + 10.0f * s;
+		}
 		chip(sortNames[sortMode], cx, chipY, chipSize, IM_COL32(255, 255, 255, 30), textC);
 		// Right: the clock and the position; below, where the library came from and the free space
 		{
 			const std::string clockStr = clockText();
-			text(clockStr, 34.0f * s, W - margin, 46.0f * s, textC, 1.0f);
+			title(clockStr, 34.0f * s, W - margin, 46.0f * s, textC, 1.0f);
+			// Favourites and settings, as in the PS5's own top bar: the star counts favourites,
+			// the gear is OPTIONS
+			float ix = W - margin - width_(clockStr, 34.0f * s) - 40.0f * s;
+			icon("gear", ix, 67.0f * s, 14.0f * s, withAlpha(textC, 0.9f));
+			ix -= 46.0f * s;
+			const std::string favs = std::to_string(favourites.size());
+			text(favs, 22.0f * s, ix, 55.0f * s, dimC, 1.0f, false);
+			ix -= width_(favs, 22.0f * s) + 20.0f * s;
+			star(ix, 67.0f * s, 13.0f * s, IM_COL32(255, 200, 70, 255));
+			// The search: lit while there is one (R3)
+			ix -= 42.0f * s;
+			icon("search", ix, 67.0f * s, 15.0f * s, searchQuery.empty() && !searchOpen ? withAlpha(textC, 0.9f) : accentC);
 			if (!view.empty()) {
 				const std::string count = std::to_string(selected + 1) + " / " + std::to_string(view.size());
-				text(count, 24.0f * s, W - margin - width_(clockStr, 34.0f * s) - 28.0f * s, 54.0f * s, dimC, 1.0f, false);
+				text(count, 24.0f * s, ix - 36.0f * s, 54.0f * s, dimC, 1.0f, false);
 			}
 			const bool live = listSource == "live";
 			std::string source = live ? "Live library" : listSource.rfind("saved", 0) == 0 ? "Saved library" :
@@ -3949,22 +4997,53 @@ public:
 		// ---- the selected game's name, category and favourite mark
 		if (!view.empty()) {
 			const Game &game = *current();
-			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f);
+			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f) * (1.0f - searchAnim);
 			const float titleSize = 54.0f * s, ty = H * 0.775f;
-			text(fit(game.title, titleSize, W * 0.8f), titleSize, W * 0.5f, ty, withAlpha(textC, fade), 0.5f);
+			title(fit(game.title, titleSize, W * 0.8f), titleSize, W * 0.5f, ty, withAlpha(textC, fade), 0.5f);
 			std::string meta = game.subtitle.empty() ? categoryName(game.section) : game.subtitle;
 			if (game.section == "Other" && game.subtitle.empty()) {
 				meta = game.titleId;
 			}
 			const bool fav = isFavourite(game);
 			const float metaSize = 24.0f * s, my = ty + 72.0f * s;
-			const float metaW = width_(meta, metaSize) + (fav ? 34.0f * s : 0.0f);
-			float mx = W * 0.5f - metaW * 0.5f;
-			if (fav) {
-				star(mx + 11.0f * s, my + metaSize * 0.5f, 11.0f * s, withAlpha(IM_COL32(255, 200, 70, 255), fade));
-				mx += 34.0f * s;
+			auto pt = playTime.find(game.titleId);
+			if (pt != playTime.end() && pt->second.seconds > 0) {
+				// Last played and play time, each with its icon, as one centred line
+				const std::string a1 = "Last played:  ", b1 = formatAgo(pt->second.last), a2 = "Play time:  ", b2 = formatDuration(pt->second.seconds);
+				const float gap = 44.0f * s, ic = 30.0f * s;
+				const float w1 = ic + width_(a1 + b1, metaSize), w2 = ic + width_(a2 + b2, metaSize);
+				float mx = W * 0.5f - (w1 + gap + w2 + (fav ? 34.0f * s : 0.0f)) * 0.5f;
+				{
+					// The pill they sit in
+					const float pw = w1 + gap + w2 + (fav ? 34.0f * s : 0.0f) + 48.0f * s, ph = metaSize + 22.0f * s;
+					const float px = W * 0.5f - pw * 0.5f, py = my - 10.0f * s;
+					dl->AddRectFilled(ImVec2(px, py), ImVec2(px + pw, py + ph), IM_COL32(13, 20, 34, (int)(200 * fade)), ph * 0.5f);
+					dl->AddRect(ImVec2(px, py), ImVec2(px + pw, py + ph), withAlpha(accentC, fade * 0.45f), ph * 0.5f, ImDrawCornerFlags_All, 1.5f * s);
+				}
+				if (fav) {
+					star(mx + 11.0f * s, my + metaSize * 0.55f, 11.0f * s, withAlpha(IM_COL32(255, 200, 70, 255), fade));
+					mx += 34.0f * s;
+				}
+				icon("clock", mx + 10.0f * s, my + metaSize * 0.58f, 11.0f * s, withAlpha(textC, fade));
+				text(a1, metaSize, mx + ic, my, withAlpha(textC, fade));
+				text(b1, metaSize, mx + ic + width_(a1, metaSize), my, withAlpha(accentC, fade));
+				mx += w1 + gap;
+				icon("play", mx + 10.0f * s, my + metaSize * 0.58f, 10.0f * s, withAlpha(textC, fade));
+				text(a2 + b2, metaSize, mx + ic, my, withAlpha(textC, fade));
+			} else {
+				const float metaW = width_(meta, metaSize) + (fav ? 34.0f * s : 0.0f);
+				float mx = W * 0.5f - metaW * 0.5f;
+				if (fav) {
+					star(mx + 11.0f * s, my + metaSize * 0.5f, 11.0f * s, withAlpha(IM_COL32(255, 200, 70, 255), fade));
+					mx += 34.0f * s;
+				}
+				text(meta, metaSize, mx, my, withAlpha(dimC, fade));
 			}
-			text(meta, metaSize, mx, my, withAlpha(dimC, fade));
+		} else if (!searchQuery.empty()) {
+			text("No games match '" + fit(searchQuery, 34.0f * s, W * 0.5f) + "'", 34.0f * s, W * 0.5f, H * 0.36f, textC, 0.5f);
+			if (!searchOpen) {
+				text("R3 changes the search, CIRCLE clears it", 24.0f * s, W * 0.5f, H * 0.36f + 54.0f * s, dimC, 0.5f);
+			}
 		} else {
 			text(std::string("No ") + filterName(filterMode), 34.0f * s, W * 0.5f, H * 0.42f, textC, 0.5f);
 			text("Press the touchpad to show another category", 24.0f * s, W * 0.5f, H * 0.42f + 54.0f * s, dimC, 0.5f);
@@ -3988,44 +5067,65 @@ public:
 			}
 		}
 
-		// ---- the game menu
+		// ---- the game menu: the game at the top, actions on the left, its cover and details on the right
 		if (menuAnim > 0.01f && current()) {
 			const Game &game = *current();
-			const float a = menuAnim, w = 1160.0f * s, h = 610.0f * s;
-			const float x0 = (W - w) * 0.5f, y0 = H * 0.16f + (1.0f - a) * 24.0f * s;
+			const float a = menuAnim, w = 1380.0f * s, h = 700.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
 			panel(x0, y0, w, h, a);
-			const float pad = 40.0f * s;
-			text(fit(game.title, 34.0f * s, w * 0.5f - pad), 34.0f * s, x0 + pad, y0 + 30.0f * s, withAlpha(textC, a));
-			chip(categoryName(game.section) + (sectionOverride.count(game.titleId) ? "" : "  (auto)"), x0 + pad, y0 + 84.0f * s, 18.0f * s,
-				withAlpha(accentC, 0.8f * a), withAlpha(white, a));
-			// Details
-			float y = y0 + 146.0f * s;
-			const float labelX = x0 + pad, valueX = x0 + pad + 170.0f * s;
-			auto row = [&](const char *label, const std::string &value) {
-				text(label, 23.0f * s, labelX, y, withAlpha(dimC, a), 0.0f, false);
-				text(fit(value, 23.0f * s, w * 0.5f - 210.0f * s), 23.0f * s, valueX, y, withAlpha(textC, a), 0.0f, false);
-				y += 44.0f * s;
-			};
-			row("Title ID", game.titleId.empty() ? "None" : game.titleId);
-			row("Platform", game.platform.empty() ? "Other" : game.platform);
-			row("Size", game.bytes == 0 && (listSource != "live" || game.titleId.empty()) ? "Unknown" : formatSize(game.bytes));
-			row("Installed", formatDate(game.installed));
-			{
-				auto pt = playTime.find(game.titleId);
-				row("Played", pt == playTime.end() ? "Not yet" : formatDuration(pt->second.seconds) + (pt->second.count > 1 ? "  (" + std::to_string(pt->second.count) + " times)" : ""));
-				row("Last played", pt == playTime.end() ? "-" : formatDate(pt->second.last));
-			}
-			row("Cover", game.coverFrom);
-			// Actions
+			const float pad = 36.0f * s;
+			// Header: a small cover, the name and the title id
+			cover(game, x0 + pad, y0 + pad, 92.0f * s, a, 12.0f * s);
+			dl->AddRect(ImVec2(x0 + pad, y0 + pad), ImVec2(x0 + pad + 92.0f * s, y0 + pad + 92.0f * s), IM_COL32(255, 255, 255, (int)(40 * a)), 12.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+			const float listW = w * 0.56f - pad;
+			title(fit(game.title, 32.0f * s, listW - 120.0f * s), 32.0f * s, x0 + pad + 116.0f * s, y0 + pad + 8.0f * s, withAlpha(white, a));
+			text(game.titleId.empty() ? categoryName(game.section) : "ID: " + game.titleId + "   \xC2\xB7   " + categoryName(game.section), 21.0f * s, x0 + pad + 116.0f * s, y0 + pad + 54.0f * s, withAlpha(dimC, a), 0.0f, false);
+			// Actions, each with its icon
 			const std::vector<std::string> items = menuItems(game);
-			const float bx = x0 + w * 0.52f, bw = w * 0.48f - pad, bh = 62.0f * s;
-			float by = y0 + 34.0f * s;
+			const float bx = x0 + pad, bw = listW, bh = 58.0f * s;
+			float by = y0 + pad + 120.0f * s;
+			dl->AddRectFilled(ImVec2(bx - 6.0f * s, by - 6.0f * s), ImVec2(bx + bw + 6.0f * s, by + items.size() * (bh + 8.0f * s) + 2.0f * s), IM_COL32(255, 255, 255, (int)(10 * a)), 16.0f * s);
 			for (int i = 0; i < (int)items.size(); i++) {
 				const bool on = i == menuIndex && !categoryOpen && !collectionsOpen;
-				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(16 * a)), 12.0f * s);
-				text(fit(items[i], 25.0f * s, bw - 44.0f * s), 25.0f * s, bx + 24.0f * s, by + 17.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				by += bh + 12.0f * s;
+				const std::string &it = items[i];
+				const std::string kind = it == "Play Game" ? "play" : it.find("Favourites") != std::string::npos ? "star" : it.rfind("Category", 0) == 0 ? "tag"
+					: it.rfind("Add to Collection", 0) == 0 ? "folder" : it.rfind("Use the Original", 0) == 0 ? "reset" : it == "Settings" ? "gear"
+					: it.find("Cover Flow") != std::string::npos ? "eye" : "close";
+				if (on) {
+					dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), withAlpha(accentC, a * 0.9f), 12.0f * s);
+					dl->AddRect(ImVec2(bx, by), ImVec2(bx + bw, by + bh), IM_COL32(170, 205, 255, (int)(230 * a)), 12.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+				} else if (i > 0) {
+					dl->AddLine(ImVec2(bx + 64.0f * s, by - 4.0f * s), ImVec2(bx + bw - 16.0f * s, by - 4.0f * s), IM_COL32(255, 255, 255, (int)(14 * a)), 1.0f * s);
+				}
+				const ImU32 ic = kind == "star" && isFavourite(game) ? IM_COL32(255, 200, 70, 255) : (on ? white : textC);
+				icon(kind, bx + 34.0f * s, by + bh * 0.5f, 12.0f * s, withAlpha(ic, a));
+				text(fit(it, 24.0f * s, bw - 90.0f * s), 24.0f * s, bx + 66.0f * s, by + 15.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
+				by += bh + 8.0f * s;
 			}
+			// The card: its cover, large, and the details
+			const float cx = x0 + w * 0.56f + 12.0f * s, cy = y0 + pad, cw = x0 + w - pad - cx, ch = h - pad * 2.0f - 50.0f * s;
+			dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + cw, cy + ch), IM_COL32(8, 16, 36, (int)(220 * a)), 18.0f * s);
+			dl->AddRect(ImVec2(cx, cy), ImVec2(cx + cw, cy + ch), withAlpha(accentC, a * 0.35f), 18.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+			const float cs = std::min(cw - 60.0f * s, 300.0f * s);
+			const float covX = cx + (cw - cs) * 0.5f, covY = cy + 28.0f * s;
+			for (int g = 3; g >= 1; g--) {
+				dl->AddRectFilled(ImVec2(covX - g * 4.0f * s, covY - g * 4.0f * s), ImVec2(covX + cs + g * 4.0f * s, covY + cs + g * 4.0f * s), withAlpha(accentC, a * 0.07f), 16.0f * s + g * 4.0f * s);
+			}
+			cover(game, covX, covY, cs, a, 14.0f * s);
+			float dy = covY + cs + 22.0f * s;
+			title(fit(game.title, 26.0f * s, cw - 48.0f * s), 26.0f * s, cx + 28.0f * s, dy, withAlpha(white, a), 0.0f, false);
+			dy += 42.0f * s;
+			auto pt = playTime.find(game.titleId);
+			auto detail = [&](const std::string &label, const std::string &value) {
+				text(label, 20.0f * s, cx + 28.0f * s, dy, withAlpha(dimC, a), 0.0f, false);
+				text(fit(value, 20.0f * s, cw - 200.0f * s), 20.0f * s, cx + 170.0f * s, dy, withAlpha(textC, a), 0.0f, false);
+				dy += 30.0f * s;
+			};
+			detail("Size", game.bytes == 0 && (listSource != "live" || game.titleId.empty()) ? "Unknown" : formatSize(game.bytes));
+			detail("Last played", pt == playTime.end() ? "Not yet" : formatAgo(pt->second.last));
+			detail("Play time", pt == playTime.end() ? "Not yet" : formatDuration(pt->second.seconds) + (pt->second.count > 1 ? "  (" + std::to_string(pt->second.count) + " times)" : ""));
+			detail("Installed", formatDate(game.installed));
+			detail("Cover", game.coverFrom);
 			hints({ { { G_DPAD_UD }, "Choose" }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } }, x0 + w * 0.5f, y0 + h - 34.0f * s, a);
 			if (collectionsOpen) {
 				const float cw = bw, ch = 80.0f * s + collectionCount * 64.0f * s;
@@ -4076,98 +5176,41 @@ public:
 			}
 		}
 
-		// ---- Dump Game / App: complete navigable UI preview; no package extraction or file copying
-		if (menuAnim > 0.01f && menuOpen && dumpOpen && current()) {
-			const Game &game = *current();
-			const float a = menuAnim, w = 900.0f * s, h = 610.0f * s;
-			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
-			panel(x0, y0, w, h, a);
-			const float pad = 36.0f * s;
-			const float rowX = x0 + pad, rowW = w - pad * 2.0f, rowH = 48.0f * s;
-			text("Dump Game / App", 32.0f * s, rowX, y0 + 26.0f * s, withAlpha(textC, a));
-			text(fit(game.title, 22.0f * s, rowW), 22.0f * s, rowX, y0 + 72.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text("TITLE ID", 16.0f * s, rowX, y0 + 112.0f * s, withAlpha(dimC, a), 0.0f, false);
-			text(game.titleId.empty() ? "Unavailable" : game.titleId, 20.0f * s, rowX, y0 + 136.0f * s, withAlpha(textC, a), 0.0f, false);
-
-			const float rowY = y0 + 172.0f * s;
-			std::vector<std::string> dumpLabels;
-			if (dumpStage == 0) {
-				dumpLabels = { "Internal storage", "USB drive", "Continue", "Cancel" };
-			} else if (dumpStage == 1) {
-				dumpLabels = { "Run UI preview", "Back to destination" };
-			} else if (dumpStage == 3) {
-				dumpLabels = { "Choose another destination", "Close" };
-			}
-			for (int i = 0; i < (int)dumpLabels.size(); i++) {
-				const float ry = rowY + i * (rowH + 7.0f * s);
-				const bool on = i == dumpIndex;
-				dl->AddRectFilled(ImVec2(rowX, ry), ImVec2(rowX + rowW, ry + rowH),
-					on ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)(14 * a)), 9.0f * s);
-				text(dumpLabels[i], 20.0f * s, rowX + 20.0f * s, ry + 12.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				if (dumpStage == 0 && i < 2 && dumpDestination == i) {
-					text("SELECTED", 14.0f * s, rowX + rowW - 18.0f * s, ry + 15.0f * s, withAlpha(on ? white : accentC, a), 1.0f, false);
-				}
-			}
-			const float statusY = y0 + 398.0f * s;
-			if (dumpStage == 0) {
-				text("DESTINATION", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text(dumpDestination == 0 ? "Internal storage" : "USB drive", 19.0f * s, rowX, statusY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("Choose where an export would be saved.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 1) {
-				text("READY TO PREVIEW", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				text("Destination: " + std::string(dumpDestination == 0 ? "Internal storage" : "USB drive"), 18.0f * s, rowX, statusY + 24.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("This is a UI demonstration only. No files will be read or written.", 16.0f * s, rowX, statusY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			} else if (dumpStage == 2 || dumpStage == 3) {
-				text(dumpStage == 2 ? "SIMULATED EXPORT PROGRESS" : "PREVIEW COMPLETE", 15.0f * s, rowX, statusY, withAlpha(dimC, a), 0.0f, false);
-				const float barY = statusY + 30.0f * s;
-				dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW, barY + 14.0f * s), IM_COL32(255, 255, 255, (int)(24 * a)), 6.0f * s);
-				if (dumpProgress > 0.0f) {
-					dl->AddRectFilled(ImVec2(rowX, barY), ImVec2(rowX + rowW * dumpProgress, barY + 14.0f * s), withAlpha(accentC, a), 6.0f * s);
-				}
-				const int percent = (int)(dumpProgress * 100.0f);
-				text(std::to_string(percent) + "%  ·  " + (dumpStage == 2 ? "Simulating progress…" : "Preview finished"), 17.0f * s, rowX, barY + 23.0f * s, withAlpha(textC, a), 0.0f, false);
-				text("No game data was dumped. Export support is not connected.", 16.0f * s, rowX, barY + 52.0f * s, withAlpha(dimC, a), 0.0f, false);
-			}
-			const char *navigationHint = dumpStage == 2 ? "Circle: cancel preview" : "D-pad: navigate";
-			hints({ { { G_DPAD_UD }, navigationHint }, { { G_CROSS }, "Select" }, { { G_CIRCLE }, "Back" } },
-				x0 + w * 0.5f, y0 + h - 28.0f * s, a);
-		}
-
 		// ---- settings
 		if (settingsAnim > 0.01f) {
 			const auto items = settingsItems();
-			const float a = settingsAnim, rowH = 46.0f * s, w = 1240.0f * s;
+			const float a = settingsAnim, rowH = 41.0f * s, w = 1240.0f * s;
 			static const std::map<int, const char *> groups = { { S_RETURN, "Library" }, { S_THEME, "Look and sound" }, { S_UPDATE_CHECK, "Updates" }, { S_LAUNCHER, "Cover Flow" } };
-			const float h = 130.0f * s + rowH * items.size() + 32.0f * s * groups.size();
+			const float h = 124.0f * s + rowH * items.size() + 30.0f * s * groups.size();
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
 			panel(x0, y0, w, h, a);
 			const float pad = 40.0f * s;
-			text("Settings", 34.0f * s, x0 + pad, y0 + 28.0f * s, withAlpha(textC, a));
+			title("Settings", 34.0f * s, x0 + pad, y0 + 28.0f * s, withAlpha(textC, a));
 			text(std::string("Cover Flow ") + coverFlowVersion, 22.0f * s, x0 + w - pad, y0 + 38.0f * s, withAlpha(dimC, a), 1.0f, false);
 			float y = y0 + 80.0f * s;
 			for (int i = 0; i < (int)items.size(); i++) {
 				auto group = groups.find(i);
 				if (group != groups.end()) {
-					text(group->second, 18.0f * s, x0 + pad, y + 7.0f * s, withAlpha(accentC, a), 0.0f, false);
-					y += 32.0f * s;
+					text(group->second, 18.0f * s, x0 + pad, y + 6.0f * s, withAlpha(accentC, a), 0.0f, false);
+					y += 30.0f * s;
 				}
 				const bool on = i == settingsIndex;
 				if (on) {
 					dl->AddRectFilled(ImVec2(x0 + 22.0f * s, y), ImVec2(x0 + w - 22.0f * s, y + rowH - 6.0f * s), withAlpha(accentC, a), 10.0f * s);
 				}
 				const ImU32 c = withAlpha(on ? white : textC, a);
-				text(items[i].first, 23.0f * s, x0 + pad, y + 8.0f * s, c, 0.0f, false);
+				text(items[i].first, 22.0f * s, x0 + pad, y + 6.0f * s, c, 0.0f, false);
 				if (!items[i].second.empty()) {
-					std::string value = fit(items[i].second, 23.0f * s, w * 0.45f);
+					std::string value = fit(items[i].second, 22.0f * s, w * 0.55f);
 					float vx = x0 + w - pad;
 					if (on && settingAdjustable(i)) {
 						// < value > when LEFT / RIGHT change it
-						text(">", 23.0f * s, vx, y + 8.0f * s, c, 1.0f, false);
+						text(">", 22.0f * s, vx, y + 6.0f * s, c, 1.0f, false);
 						vx -= 30.0f * s;
-						text(value, 23.0f * s, vx, y + 8.0f * s, c, 1.0f, false);
-						text("<", 23.0f * s, vx - width_(value, 23.0f * s) - 14.0f * s, y + 8.0f * s, c, 1.0f, false);
+						text(value, 22.0f * s, vx, y + 6.0f * s, c, 1.0f, false);
+						text("<", 22.0f * s, vx - width_(value, 22.0f * s) - 14.0f * s, y + 6.0f * s, c, 1.0f, false);
 					} else {
-						text(value, 23.0f * s, vx, y + 8.0f * s, on ? c : withAlpha(dimC, a), 1.0f, false);
+						text(value, 22.0f * s, vx, y + 6.0f * s, on ? c : withAlpha(dimC, a), 1.0f, false);
 					}
 				}
 				y += rowH;
@@ -4195,7 +5238,7 @@ public:
 			const float a = dialogAnim, w = 900.0f * s, h = 300.0f * s + notes.size() * 34.0f * s + (notes.empty() ? 0.0f : 20.0f * s);
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
 			panel(x0, y0, w, h, a);
-			text("Update available", 34.0f * s, W * 0.5f, y0 + 34.0f * s, withAlpha(textC, a), 0.5f);
+			title("Update available", 34.0f * s, W * 0.5f, y0 + 34.0f * s, withAlpha(textC, a), 0.5f);
 			text(std::string("Cover Flow ") + coverFlowVersion + "   ->   " + updateTag, 24.0f * s, W * 0.5f, y0 + 92.0f * s, withAlpha(dimC, a), 0.5f, false);
 			for (size_t i = 0; i < notes.size(); i++) {
 				text(fit(notes[i], 22.0f * s, w - 120.0f * s), 22.0f * s, x0 + 60.0f * s, y0 + 146.0f * s + i * 34.0f * s, withAlpha(textC, a), 0.0f, false);
@@ -4216,7 +5259,7 @@ public:
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
 			panel(x0, y0, w, h, 1.0f);
 			const float pad = 40.0f * s;
-			text("Launcher", 34.0f * s, x0 + pad, y0 + 28.0f * s, textC);
+			title("Launcher", 34.0f * s, x0 + pad, y0 + 28.0f * s, textC);
 			text(launcherStatus, 22.0f * s, x0 + w - pad, y0 + 38.0f * s, dimC, 1.0f, false);
 			dl->AddRectFilled(ImVec2(x0 + pad, y0 + 90.0f * s), ImVec2(x0 + w - pad, y0 + h - 90.0f * s), IM_COL32(0, 0, 0, 120), 12.0f * s);
 			const float lineH = 28.0f * s;
@@ -4228,6 +5271,327 @@ public:
 				ly += lineH;
 			}
 			hints({ { { G_CROSS }, "Reload the launcher" }, { { G_CIRCLE }, "Close" } }, W * 0.5f, y0 + h - 44.0f * s, 1.0f);
+		}
+
+		// ---- the backup wizard
+		if (wizardAnim > 0.01f && wizard != WZ_NONE) {
+			const float a = wizardAnim, w = 1360.0f * s, h = 780.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
+			const float pad = 56.0f * s;
+			// Dim everything behind, then the panel with a thin accent line along its top
+			dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(4, 6, 14, (int)(150 * a)));
+			panel(x0, y0, w, h, a);
+			dl->AddRectFilled(ImVec2(x0 + 30.0f * s, y0), ImVec2(x0 + w - 30.0f * s, y0 + 4.0f * s), withAlpha(accentC, a * 0.9f), 2.0f * s);
+			auto wrap = [&](const std::string &str, float size, float maxW) {
+				std::vector<std::string> lines;
+				std::stringstream ws(str);
+				std::string word, line;
+				while (ws >> word) {
+					const std::string next = line.empty() ? word : line + " " + word;
+					if (!line.empty() && width_(next, size) > maxW) {
+						lines.push_back(line);
+						line = word;
+					} else {
+						line = next;
+					}
+				}
+				if (!line.empty()) {
+					lines.push_back(line);
+				}
+				return lines;
+			};
+			auto paragraph = [&](const std::string &str, float size, float x, float y, float maxW, ImU32 c) {
+				for (const std::string &l : wrap(str, size, maxW)) {
+					text(l, size, x, y, c, 0.0f, false);
+					y += size * 1.45f;
+				}
+				return y;
+			};
+			// A USB stick, drawn: body, connector, light
+			auto driveIcon = [&](float cx, float cy, float k, ImU32 c) {
+				dl->AddRectFilled(ImVec2(cx - 22.0f * k, cy - 34.0f * k), ImVec2(cx + 22.0f * k, cy + 30.0f * k), c, 9.0f * k);
+				dl->AddRectFilled(ImVec2(cx - 13.0f * k, cy - 52.0f * k), ImVec2(cx + 13.0f * k, cy - 34.0f * k), withAlpha(white, 0.55f * a), 3.0f * k);
+				dl->AddRectFilled(ImVec2(cx - 7.0f * k, cy - 47.0f * k), ImVec2(cx - 2.0f * k, cy - 41.0f * k), IM_COL32(30, 34, 50, (int)(255 * a)));
+				dl->AddRectFilled(ImVec2(cx + 2.0f * k, cy - 47.0f * k), ImVec2(cx + 7.0f * k, cy - 41.0f * k), IM_COL32(30, 34, 50, (int)(255 * a)));
+				dl->AddCircleFilled(ImVec2(cx, cy + 14.0f * k), 4.0f * k, withAlpha(IM_COL32(120, 220, 160, 255), a));
+			};
+			const bool restore = wizardRestore || wizard == WZ_MANAGE || wizard == WZ_RESTORE_CONFIRM;
+			std::string heading, subtitle;
+			switch (wizard) {
+			case WZ_DRIVES: heading = "Back up to USB"; subtitle = "Choose a drive for Cover Flow's settings, favourites, collections, play time and your own covers and names."; break;
+			case WZ_CONFIRM: heading = "Ready to back up"; subtitle = "Check what will be saved, then start."; break;
+			case WZ_PROGRESS: heading = wizardRestore ? "Restoring" : "Backing up"; subtitle = "Keep the USB drive plugged in."; break;
+			case WZ_DONE: heading = wizardRestore ? "Restore complete" : "Backup complete"; break;
+			case WZ_ERROR: heading = wizardRestore ? "Restore stopped" : "Backup stopped"; break;
+			case WZ_MANAGE: heading = "Backups on USB"; subtitle = "Choose a backup to restore. Only Cover Flow's own data is restored - games are never touched."; break;
+			case WZ_RESTORE_CONFIRM: heading = "Restore this backup?"; break;
+			default: break;
+			}
+			driveIcon(x0 + pad + 26.0f * s, y0 + 66.0f * s, 0.62f * s, withAlpha(accentC, a));
+			title(heading, 38.0f * s, x0 + pad + 70.0f * s, y0 + 36.0f * s, withAlpha(white, a), 0.0f);
+			if (!subtitle.empty()) {
+				text(fit(subtitle, 22.0f * s, w - pad * 2.0f - 70.0f * s), 22.0f * s, x0 + pad + 70.0f * s, y0 + 90.0f * s, withAlpha(dimC, a), 0.0f, false);
+			}
+			const int cards = wizardCards();
+			const float bodyY = y0 + 150.0f * s, bodyH = h - 150.0f * s - 150.0f * s;
+			auto backupLine = [&](const UsbDrive &d) {
+				if (d.state == "complete") {
+					return "Backup from " + formatDate(d.date);
+				}
+				if (d.state == "old") {
+					return "Older backup from " + formatDate(d.date);
+				}
+				if (d.state == "incomplete") {
+					return std::string("Unfinished backup");
+				}
+				return std::string("No Cover Flow backup");
+			};
+			// ---- drive cards (choose a drive, or a backup)
+			if (wizard == WZ_DRIVES || wizard == WZ_MANAGE) {
+				if (usbLoading && usbDrives.empty()) {
+					text("Looking for USB drives...", 28.0f * s, W * 0.5f, bodyY + bodyH * 0.4f, withAlpha(dimC, a), 0.5f, false);
+				} else if (usbDrives.empty()) {
+					text("No USB drive found", 32.0f * s, W * 0.5f, bodyY + bodyH * 0.3f, withAlpha(textC, a), 0.5f, false);
+					text("Plug one into the PS5, then choose Look again.", 24.0f * s, W * 0.5f, bodyY + bodyH * 0.3f + 54.0f * s, withAlpha(dimC, a), 0.5f, false);
+				} else {
+					// One row per drive, as in the PS5's own lists: icon, name, space, its backup, a radio button
+					const int n = (int)usbDrives.size();
+					const float rx = x0 + pad, rw = w - pad * 2.0f, rh = std::min(112.0f * s, (bodyH - 20.0f * s) / std::max(1, n) - 14.0f * s);
+					float ry = bodyY + 10.0f * s;
+					for (int i = 0; i < n; i++, ry += rh + 14.0f * s) {
+						const UsbDrive &d = usbDrives[i];
+						const bool focus = wizardFocus == i, chosen = wizardDrive == i, usable = wizard == WZ_DRIVES || d.restorable();
+						const float ca = a * (usable ? 1.0f : 0.45f);
+						dl->AddRectFilled(ImVec2(rx, ry), ImVec2(rx + rw, ry + rh), focus ? IM_COL32(28, 70, 150, (int)(235 * ca)) : IM_COL32(255, 255, 255, (int)(12 * ca)), 14.0f * s);
+						dl->AddRect(ImVec2(rx, ry), ImVec2(rx + rw, ry + rh), focus ? IM_COL32(120, 180, 255, (int)(255 * a)) : IM_COL32(255, 255, 255, (int)(26 * ca)), 14.0f * s, ImDrawCornerFlags_All, focus ? 2.5f * s : 1.0f * s);
+						// The drive in a rounded square
+						const float ix = rx + 22.0f * s, iy = ry + (rh - 66.0f * s) * 0.5f;
+						dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + 66.0f * s, iy + 66.0f * s), IM_COL32(255, 255, 255, (int)(22 * ca)), 14.0f * s);
+						driveIcon(ix + 33.0f * s, iy + 38.0f * s, 0.55f * s, withAlpha(focus ? white : IM_COL32(170, 190, 230, 255), ca));
+						title(d.label, 26.0f * s, ix + 90.0f * s, ry + rh * 0.5f - 32.0f * s, withAlpha(white, ca), 0.0f, false);
+						text("Free: " + formatSize(std::max(1LL, d.freeBytes)) + " / " + formatSize(std::max(1LL, d.totalBytes)), 20.0f * s, ix + 90.0f * s, ry + rh * 0.5f + 4.0f * s, withAlpha(focus ? white : dimC, ca * 0.9f), 0.0f, false);
+						// Its backup, in the middle
+						const float mx = rx + rw * 0.42f;
+						const ImU32 stateC = d.state == "complete" ? IM_COL32(120, 220, 160, 255) : d.state == "incomplete" ? IM_COL32(240, 180, 90, 255) : IM_COL32(170, 178, 200, 255);
+						dl->AddCircleFilled(ImVec2(mx, ry + rh * 0.5f - 18.0f * s), 6.0f * s, withAlpha(stateC, ca));
+						text(backupLine(d) + (wizard == WZ_DRIVES && d.state != "none" ? "  -  will be replaced" : ""), 21.0f * s, mx + 18.0f * s, ry + rh * 0.5f - 31.0f * s, withAlpha(textC, ca), 0.0f, false);
+						if (d.state == "complete") {
+							text(std::to_string(d.covers) + " covers  \xC2\xB7  " + std::to_string(d.names) + " names  \xC2\xB7  " + formatDuration(d.seconds) + " of play time", 19.0f * s, mx + 18.0f * s, ry + rh * 0.5f + 4.0f * s, withAlpha(focus ? white : dimC, ca * 0.9f), 0.0f, false);
+						}
+						if (wizard == WZ_MANAGE && d.state != "none") {
+							text("/mnt/" + d.id + "/CoverFlowBackup", 17.0f * s, mx + 18.0f * s, ry + rh * 0.5f + 30.0f * s, withAlpha(accentC, ca), 0.0f, false);
+						}
+						// The radio button
+						const float bx2 = rx + rw - 44.0f * s, by2 = ry + rh * 0.5f;
+						dl->AddCircle(ImVec2(bx2, by2), 14.0f * s, withAlpha(focus || chosen ? white : IM_COL32(170, 180, 205, 255), ca), 32, 2.5f * s);
+						if (chosen) {
+							dl->AddCircleFilled(ImVec2(bx2, by2), 7.5f * s, withAlpha(focus ? white : accentC, ca), 24);
+						}
+					}
+				}
+			}
+			// ---- confirm a backup: what goes where
+			if (wizard == WZ_CONFIRM && wizardDrive >= 0 && wizardDrive < (int)usbDrives.size()) {
+				const UsbDrive &d = usbDrives[wizardDrive];
+				int covers = 0, names = 0;
+				const auto items = backupItems(covers, names);
+				long long bytes = 0;
+				for (const auto &it : items) {
+					bytes += std::max(0LL, it.second);
+				}
+				std::vector<std::string> what = { "Settings, theme and the last game you were on", "Favourites, collections, categories and hidden games", "Play time for every game" };
+				what.push_back(covers ? std::to_string(covers) + (covers == 1 ? " cover of your own" : " covers of your own") : std::string("Your own covers (none yet)"));
+				what.push_back(names ? std::to_string(names) + (names == 1 ? " name of your own" : " names of your own") : std::string("Your own names (none yet)"));
+				float ly = bodyY + 24.0f * s;
+				text("What is saved", 20.0f * s, x0 + pad, ly, withAlpha(accentC, a), 0.0f, false);
+				ly += 44.0f * s;
+				for (const std::string &line : what) {
+					dl->AddCircleFilled(ImVec2(x0 + pad + 12.0f * s, ly + 13.0f * s), 12.0f * s, withAlpha(accentC, a * 0.9f));
+					dl->AddLine(ImVec2(x0 + pad + 6.0f * s, ly + 13.0f * s), ImVec2(x0 + pad + 11.0f * s, ly + 18.0f * s), withAlpha(white, a), 2.5f * s);
+					dl->AddLine(ImVec2(x0 + pad + 11.0f * s, ly + 18.0f * s), ImVec2(x0 + pad + 19.0f * s, ly + 8.0f * s), withAlpha(white, a), 2.5f * s);
+					text(line, 24.0f * s, x0 + pad + 40.0f * s, ly, withAlpha(textC, a), 0.0f, false);
+					ly += 46.0f * s;
+				}
+				// What it never touches, in a box
+				{
+					const float ix = x0 + pad, iy = ly + 6.0f * s, iw = w * 0.5f, ih = 70.0f * s;
+					dl->AddRectFilled(ImVec2(ix, iy), ImVec2(ix + iw, iy + ih), IM_COL32(255, 190, 70, (int)(22 * a)), 12.0f * s);
+					dl->AddRect(ImVec2(ix, iy), ImVec2(ix + iw, iy + ih), IM_COL32(255, 190, 70, (int)(120 * a)), 12.0f * s, ImDrawCornerFlags_All, 1.5f * s);
+					icon("info", ix + 30.0f * s, iy + ih * 0.5f, 13.0f * s, withAlpha(IM_COL32(255, 200, 90, 255), a));
+					text("Only Cover Flow's own files are copied.", 20.0f * s, ix + 58.0f * s, iy + 12.0f * s, withAlpha(textC, a), 0.0f, false);
+					text("Games, saves and system files are never read or copied.", 20.0f * s, ix + 58.0f * s, iy + 38.0f * s, withAlpha(dimC, a), 0.0f, false);
+				}
+				// The destination, as a card on the right
+				const float cx = x0 + w - pad - 480.0f * s, cy = bodyY + 24.0f * s, cw = 480.0f * s, ch = 300.0f * s;
+				dl->AddRectFilled(ImVec2(cx, cy), ImVec2(cx + cw, cy + ch), IM_COL32(255, 255, 255, (int)(14 * a)), 18.0f * s);
+				text("Saved to", 20.0f * s, cx + 30.0f * s, cy + 24.0f * s, withAlpha(accentC, a), 0.0f, false);
+				driveIcon(cx + 64.0f * s, cy + 120.0f * s, 0.8f * s, withAlpha(accentC, a));
+				text(d.label, 30.0f * s, cx + 112.0f * s, cy + 82.0f * s, withAlpha(white, a), 0.0f, false);
+				text("/mnt/" + d.id + "/CoverFlowBackup", 18.0f * s, cx + 112.0f * s, cy + 124.0f * s, withAlpha(dimC, a), 0.0f, false);
+				text("About " + formatSize(std::max(1LL, bytes)) + "  \xC2\xB7  " + formatSize(std::max(1LL, d.freeBytes)) + " free", 20.0f * s, cx + 30.0f * s, cy + 190.0f * s, withAlpha(textC, a), 0.0f, false);
+				if (d.state != "none") {
+					text(fit("Replaces: " + backupLine(d), 20.0f * s, cw - 60.0f * s), 20.0f * s, cx + 30.0f * s, cy + 226.0f * s, withAlpha(IM_COL32(240, 180, 90, 255), a), 0.0f, false);
+				}
+			}
+			// ---- progress: real files, read back and checked
+			if (wizard == WZ_PROGRESS && wizardJob) {
+				int done, total;
+				long long bytes;
+				std::string stage;
+				{
+					std::lock_guard<std::mutex> lock(wizardJob->mutex);
+					done = wizardJob->done;
+					total = std::max(1, wizardJob->total);
+					bytes = wizardJob->bytes;
+					stage = wizardJob->stage;
+				}
+				const float target = (float)done / (float)total;
+				static float shown = 0.0f;
+				shown = done == 0 ? 0.0f : shown + (target - shown) * 0.15f;
+				const int pct = (int)std::lround(shown * 100.0f);
+				// A ring around the percentage, with the drive in it
+				{
+					const float rcx = W * 0.5f, rcy = bodyY + 92.0f * s, rr = 86.0f * s;
+					dl->AddCircle(ImVec2(rcx, rcy), rr, IM_COL32(255, 255, 255, (int)(26 * a)), 64, 10.0f * s);
+					if (shown > 0.001f) {
+						for (int g = 2; g >= 0; g--) {
+							dl->PathArcTo(ImVec2(rcx, rcy), rr, -1.5708f, -1.5708f + 6.2832f * shown, 64);
+							dl->PathStroke(g == 0 ? withAlpha(accentC, a) : withAlpha(accentC, a * 0.12f), false, g == 0 ? 10.0f * s : (10.0f + g * 8.0f) * s);
+						}
+					}
+					driveIcon(rcx, rcy - 14.0f * s, 0.42f * s, withAlpha(white, a));
+					title(std::to_string(pct) + "%", 40.0f * s, rcx, rcy + 10.0f * s, withAlpha(white, a), 0.5f);
+				}
+				const float bx = x0 + pad + 60.0f * s, bw = w - pad * 2.0f - 120.0f * s, by = bodyY + 214.0f * s, bh = 10.0f * s;
+				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), IM_COL32(255, 255, 255, (int)(26 * a)), bh * 0.5f);
+				dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + std::max(bh, bw * shown), by + bh), withAlpha(accentC, a), bh * 0.5f);
+				// A soft light running along the filled part
+				const float run = std::fmod(clock * 0.6f, 1.0f) * std::max(bh, bw * shown);
+				dl->AddRectFilledMultiColor(ImVec2(bx + std::max(0.0f, run - 80.0f * s), by), ImVec2(bx + run, by + bh), IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, (int)(90 * a)), IM_COL32(255, 255, 255, (int)(90 * a)), IM_COL32(255, 255, 255, 0));
+				text(fit(stage, 24.0f * s, bw), 24.0f * s, bx, by + 40.0f * s, withAlpha(textC, a), 0.0f, false);
+				const int secs = (int)(clock - wizardStarted);
+				char info[96];
+				std::snprintf(info, sizeof(info), "%d of %d files   \xC2\xB7   %s", std::max(0, done - 1), std::max(0, total - 2), formatSize(std::max(1LL, bytes)).c_str());
+				text(info, 22.0f * s, bx + bw, by + 42.0f * s, withAlpha(accentC, a), 1.0f, false);
+				// Elapsed time and the estimate, in two columns
+				auto clockOf = [](int t) {
+					char b[16];
+					std::snprintf(b, sizeof(b), "%02d:%02d:%02d", t / 3600, (t / 60) % 60, t % 60);
+					return std::string(b);
+				};
+				const int left = done > 1 ? (int)((clock - wizardStarted) * (float)(total - done) / (float)(done - 1)) : -1;
+				const float cy2 = by + 92.0f * s;
+				dl->AddLine(ImVec2(W * 0.5f, cy2), ImVec2(W * 0.5f, cy2 + 64.0f * s), IM_COL32(255, 255, 255, (int)(30 * a)), 1.5f * s);
+				text("Elapsed time", 20.0f * s, bx, cy2, withAlpha(dimC, a), 0.0f, false);
+				title(clockOf(secs), 30.0f * s, bx, cy2 + 28.0f * s, withAlpha(white, a), 0.0f, false);
+				text("Estimated time remaining", 20.0f * s, W * 0.5f + 40.0f * s, cy2, withAlpha(dimC, a), 0.0f, false);
+				title(left < 0 ? std::string("--:--:--") : clockOf(left), 30.0f * s, W * 0.5f + 40.0f * s, cy2 + 28.0f * s, withAlpha(white, a), 0.0f, false);
+			}
+			// ---- done / stopped
+			if (wizard == WZ_DONE || wizard == WZ_ERROR) {
+				const bool ok = wizard == WZ_DONE;
+				const float cx = W * 0.5f, cy = bodyY + 90.0f * s, r = 52.0f * s;
+				const ImU32 c = ok ? IM_COL32(80, 200, 140, 255) : IM_COL32(235, 150, 70, 255);
+				dl->AddCircleFilled(ImVec2(cx, cy), r, withAlpha(c, a * 0.22f), 48);
+				dl->AddCircle(ImVec2(cx, cy), r, withAlpha(c, a), 48, 4.0f * s);
+				if (ok) {
+					dl->AddLine(ImVec2(cx - 22.0f * s, cy + 2.0f * s), ImVec2(cx - 6.0f * s, cy + 18.0f * s), withAlpha(white, a), 6.0f * s);
+					dl->AddLine(ImVec2(cx - 6.0f * s, cy + 18.0f * s), ImVec2(cx + 24.0f * s, cy - 16.0f * s), withAlpha(white, a), 6.0f * s);
+				} else {
+					dl->AddLine(ImVec2(cx, cy - 26.0f * s), ImVec2(cx, cy + 8.0f * s), withAlpha(white, a), 7.0f * s);
+					dl->AddCircleFilled(ImVec2(cx, cy + 24.0f * s), 4.5f * s, withAlpha(white, a));
+				}
+				float ty = cy + r + 40.0f * s;
+				for (const std::string &l : wrap(wizardResult, 26.0f * s, w * 0.7f)) {
+					text(l, 26.0f * s, W * 0.5f, ty, withAlpha(textC, a), 0.5f, false);
+					ty += 38.0f * s;
+				}
+			}
+			// ---- confirm a restore
+			if (wizard == WZ_RESTORE_CONFIRM && wizardDrive >= 0 && wizardDrive < (int)usbDrives.size()) {
+				const UsbDrive &d = usbDrives[wizardDrive];
+				float ly = bodyY + 20.0f * s;
+				driveIcon(x0 + pad + 40.0f * s, ly + 74.0f * s, 0.9f * s, withAlpha(accentC, a));
+				text(d.label + "  \xC2\xB7  " + backupLine(d), 30.0f * s, x0 + pad + 100.0f * s, ly + 30.0f * s, withAlpha(white, a), 0.0f, false);
+				if (d.state == "complete") {
+					text(std::to_string(d.covers) + " covers  \xC2\xB7  " + std::to_string(d.names) + " names  \xC2\xB7  " + formatDuration(d.seconds) + " of play time", 22.0f * s, x0 + pad + 100.0f * s, ly + 76.0f * s, withAlpha(dimC, a), 0.0f, false);
+				}
+				ly += 160.0f * s;
+				ly = paragraph("This replaces Cover Flow's current settings, favourites, collections, play time and your own covers and names with the ones in this backup.", 24.0f * s, x0 + pad, ly, w - pad * 2.0f, withAlpha(textC, a));
+				paragraph("Your games are not touched. Cover Flow closes when it is done - open it again from the home screen.", 24.0f * s, x0 + pad, ly + 12.0f * s, w - pad * 2.0f, withAlpha(dimC, a));
+			}
+			// ---- buttons along the bottom
+			{
+				const std::vector<std::string> buttons = wizardButtons();
+				const float bw = 300.0f * s, bh = 66.0f * s, gap = 24.0f * s;
+				float bx = W * 0.5f - (buttons.size() * bw + (buttons.size() - 1) * gap) * 0.5f;
+				const float by = y0 + h - bh - 74.0f * s;
+				for (int i = 0; i < (int)buttons.size(); i++, bx += bw + gap) {
+					const bool focus = wizardFocus == cards + i || (cards > 0 && wizardFocus < cards && i == 0);
+					const bool strong = wizardFocus == cards + i;
+					dl->AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), strong ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)((focus ? 34 : 20) * a)), bh * 0.5f);
+					text(buttons[i], 26.0f * s, bx + bw * 0.5f, by + 18.0f * s, withAlpha(white, a), 0.5f, false);
+				}
+				hints({ { { G_DPAD_UD }, "Choose" }, { { G_CROSS }, cards > 0 && wizardFocus < cards ? std::string(restore ? "Restore this" : "Use this drive") : std::string("Select") }, { { G_CIRCLE }, "Back" } }, W * 0.5f, y0 + h - 30.0f * s, a);
+			}
+		}
+
+		// ---- the search keyboard, along the bottom so the matching covers stay in sight
+		if (searchAnim > 0.01f) {
+			const float a = searchAnim, pad = 34.0f * s, gap = 10.0f * s, keyH = 62.0f * s, fieldH = 76.0f * s;
+			const float w = 1060.0f * s, keyW = (w - pad * 2.0f - gap * (searchCols - 1)) / searchCols;
+			const float h = pad + fieldH + 22.0f * s + 5.0f * keyH + 4.0f * gap + 64.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = H - h - 36.0f * s + (1.0f - a) * 40.0f * s;
+			panel(x0, y0, w, h, a);
+			// The field: what is typed, a caret, and how many games match
+			const float fx = x0 + pad, fy = y0 + pad, fw = w - pad * 2.0f;
+			dl->AddRectFilled(ImVec2(fx, fy), ImVec2(fx + fw, fy + fieldH), IM_COL32(4, 8, 18, (int)(230 * a)), 18.0f * s);
+			dl->AddRect(ImVec2(fx, fy), ImVec2(fx + fw, fy + fieldH), withAlpha(accentC, a * 0.9f), 18.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+			icon("search", fx + 44.0f * s, fy + fieldH * 0.5f, 17.0f * s, withAlpha(accentC, a));
+			const float qs = 32.0f * s, qx = fx + 80.0f * s, qy = fy + (fieldH - qs) * 0.45f;
+			const std::string count = std::to_string(view.size()) + (view.size() == 1 ? " game" : " games");
+			const float countW = width_(count, 22.0f * s);
+			if (searchQuery.empty()) {
+				text("Search your games", qs, qx, qy, withAlpha(dimC, a * 0.8f), 0.0f, false);
+			} else {
+				const std::string shown = fit(searchQuery, qs, fw - 140.0f * s - countW);
+				title(shown, qs, qx, qy, withAlpha(textC, a));
+				if (std::fmod(clock, 1.0f) < 0.6f) {
+					const float caretX = qx + width_(shown, qs) * 1.04f + 4.0f * s;
+					dl->AddRectFilled(ImVec2(caretX, fy + 18.0f * s), ImVec2(caretX + 3.0f * s, fy + fieldH - 18.0f * s), withAlpha(accentC, a));
+				}
+			}
+			text(count, 22.0f * s, fx + fw - 34.0f * s, fy + (fieldH - 22.0f * s) * 0.48f, withAlpha(searchQuery.empty() ? dimC : textC, a), 1.0f, false);
+			// The keys
+			float ky = fy + fieldH + 22.0f * s;
+			auto key = [&](const std::string &label, float x, float kw, bool focus, bool wide) {
+				const float r = 12.0f * s;
+				dl->AddRectFilled(ImVec2(x, ky), ImVec2(x + kw, ky + keyH), focus ? withAlpha(accentC, a) : IM_COL32(255, 255, 255, (int)((wide ? 22 : 14) * a)), r);
+				if (focus) {
+					dl->AddRect(ImVec2(x - 3.0f * s, ky - 3.0f * s), ImVec2(x + kw + 3.0f * s, ky + keyH + 3.0f * s), IM_COL32(170, 205, 255, (int)(230 * a)), r + 3.0f * s, ImDrawCornerFlags_All, 2.0f * s);
+				} else {
+					dl->AddRect(ImVec2(x, ky), ImVec2(x + kw, ky + keyH), IM_COL32(255, 255, 255, (int)(26 * a)), r, ImDrawCornerFlags_All, 1.0f * s);
+				}
+				const float ls = wide ? 24.0f * s : 30.0f * s;
+				if (wide) {
+					text(label, ls, x + kw * 0.5f, ky + (keyH - ls) * 0.46f, withAlpha(focus ? white : textC, a), 0.5f, false);
+				} else {
+					title(label, ls, x + kw * 0.5f, ky + (keyH - ls) * 0.42f, withAlpha(focus ? white : textC, a), 0.5f);
+				}
+			};
+			for (int row = 0; row < 4; row++) {
+				for (int col = 0; col < searchCols; col++) {
+					key(std::string(1, searchRows[row][col]), fx + col * (keyW + gap), keyW, searchRow == row && searchCol == col, false);
+				}
+				ky += keyH + gap;
+			}
+			const int bottomFocus = searchRow == 4 ? searchBottomKey() : -1;
+			for (int k = 0; k < 4; k++) {
+				const SearchKey &b = searchBottom[k];
+				key(b.label, fx + b.from * (keyW + gap), b.span * keyW + (b.span - 1) * gap, bottomFocus == k, true);
+			}
+			hints({ { { G_CROSS }, "Type" }, { { G_SQUARE }, "Delete" }, { { G_TRIANGLE }, "Space" }, { { G_L1, G_R1 }, "Browse matches" }, { { G_CIRCLE }, "Done" } },
+				W * 0.5f, y0 + h - 34.0f * s, a);
 		}
 
 		// ---- the toast: messages slide in above the hints
@@ -4243,11 +5607,14 @@ public:
 		}
 
 		// ---- the hints along the bottom
-		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && !launcherPanel) {
+		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && wizardAnim < 0.5f && searchAnim < 0.5f && !launcherPanel) {
 			std::vector<std::pair<std::vector<Glyph>, std::string>> items = {
 				{ { G_DPAD_LR }, "Browse" }, { { G_L2, G_R2 }, "Letter" }, { { G_CROSS }, "Start" }, { { G_TRIANGLE }, "Menu" },
-				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
+				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_R3 }, "Search" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
 			};
+			if (!searchQuery.empty()) {
+				items.insert(items.begin() + 6, { { G_CIRCLE }, "Clear search" });
+			}
 			if (settings.quitWith == 0) {
 				items.push_back({ { G_OPTIONS, G_SHARE }, "Quit" });
 			} else if (settings.quitWith == 1) {
@@ -4255,6 +5622,9 @@ public:
 			} else if (settings.quitWith == 2) {
 				items.push_back({ { G_CIRCLE }, "Hold to quit" });
 			}
+			// A dark bar under the button guide
+			dl->AddRectFilled(ImVec2(margin, H - 84.0f * s), ImVec2(W - margin, H - 30.0f * s), IM_COL32(13, 20, 34, 200), 27.0f * s);
+			dl->AddRect(ImVec2(margin, H - 84.0f * s), ImVec2(W - margin, H - 30.0f * s), withAlpha(accentC, 0.25f), 27.0f * s, ImDrawCornerFlags_All, 1.2f * s);
 			hints(items, W * 0.5f, H - 58.0f * s, 1.0f);
 		}
 

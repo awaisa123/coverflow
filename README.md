@@ -11,11 +11,14 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 - Play time per game, with Recently played, Most played and Largest first sorts
 - Your own names and covers, shown only in Cover Flow (the console's own data is never changed)
 - Favourites, hide, categories (PS5 / PS4 / Emulators / Homebrew) and six collections
+- Search with an on-screen keyboard (R3): covers filter as you type
 - Sort and filter, letter jump (L2/R2), fast scroll with the right stick
 - Details panel with size, install date, play time and storage location
 - Themes: six built in, your own picture/colours/font/music, and interface sounds
 - Header with clock and free storage; free space on every drive in Settings
-- USB backup and restore of settings, collections and play time
+- Back up and Restore wizard: choose a USB drive, see what is saved, real progress;
+  every file is read back and checked with SHA-256
+- Showcase layout (tall covers) or Classic, in Settings
 - Launcher status and log inside Settings
 - Updates itself from this repository's releases, every file checked with SHA-256
 
@@ -29,6 +32,7 @@ A Cover Flow game library for jailbroken PS5 consoles (homebrew), built on
 | Triangle | Menu (details, favourite, hide, category, collections) |
 | Square | Sort |
 | Touchpad | Filter |
+| R3 | Search (Circle clears it) |
 | L3 | Cover Flow / grid |
 | Options | Settings |
 | Options + Share (held) | Quit (changeable in Settings) |
@@ -68,10 +72,25 @@ updater) and the full title folder as `PPSA99123_vNN.zip`, tagged with the versi
 ## Building
 Built inside PS5_VulkanTemplate: `source/coverflow.cpp` is the sample, the shaders
 go in `shaders/glsl/coverflow/`, and `source/make_files.py` embeds the compiled
-shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
+shaders, `sce_sys/icon0.png` and `assets/Roboto-Bold.ttf` in the eboot (run it after
+changing any of them). `source/base/VulkanUIOverlay.cpp` replaces the template's
+`base/VulkanUIOverlay.cpp`: it lets the overlay draw cover textures and loads the bold
+font.
 `cflaunch` builds with the PS5 Payload SDK using `source/cflaunch.Makefile`.
 
 ## Changes
+- **v22** - Search: R3 opens an on-screen keyboard and the covers filter as you type
+  (names, original names and title ids; spaces and punctuation ignored, so
+  "spiderman" finds "Spider-Man"). Circle clears the search.
+- **v21** - The blue look matched to the design: bold headings, star and gear in the
+  header, last played and play time in a pill, a bar behind the button guide, clearer
+  backup and restore screens with time remaining.
+- **v20** - Showcase layout: tall covers, gently turned, with a larger selected cover
+  (Classic is in Settings).
+- **v19** - New look: navy panels with a blue glow, icon game menu with the real cover.
+- **v18** - Back up and Restore wizard (launcher 12): choose a drive, confirm, real
+  progress with Cancel, every copy checked with SHA-256, unfinished backups never
+  restored. Backups include your own covers and names.
 - **v17** - Your own names and covers (imported from USB, kept in Cover Flow's own
   folder, undo per game), Largest first sort, free space on every drive in Settings.
   Launcher 11 only accepts commands from the console itself, checks title ids
@@ -96,6 +115,8 @@ shaders and `sce_sys/icon0.png` in the eboot (run it after changing either).
 ## Licences
 - Cover Flow (`source/coverflow.cpp`, shaders, `make_files.py`): MIT
 - cflaunch (`source/cflaunch.c`): GPL-3.0-or-later, based on PS5_Vulkan's ps5vkctl
+- Roboto Bold (`source/assets/Roboto-Bold.ttf`): Apache-2.0, Christian Robertson /
+  Google Fonts (`licenses/title/Roboto-Apache-2.0.txt`)
 - The title links the PS5 platform layer (GPL-3.0-or-later), RADV/Mesa (MIT and
   others), Dear ImGui, KTX, tinygltf and volk; their licences are in `licenses/`.
 

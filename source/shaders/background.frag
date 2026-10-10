@@ -25,6 +25,11 @@ void main()
 			uv.y *= r;
 		}
 		color = texture(picture, uv + 0.5).rgb * (1.0 - pc.mvp[0][2]);
+		if (mode > 1.5) {
+			// A game's artwork takes on the navy of the rest
+			float l = dot(color, vec3(0.299, 0.587, 0.114));
+			color = mix(color, vec3(0.05, 0.12, 0.30) + l * vec3(0.35, 0.55, 1.0), 0.45);
+		}
 	} else {
 		vec3 accent = pc.params.xyz;
 		vec2 a = inUV - vec2(0.5 + 0.08 * sin(t * 0.11), horizon - 0.14 + 0.03 * sin(t * 0.17));
@@ -33,9 +38,15 @@ void main()
 		b.x *= 1.4;
 		float glowA = exp(-dot(a, a) * 5.0);
 		float glowB = exp(-dot(b, b) * 7.0);
-		color = vec3(0.010, 0.012, 0.020);
-		color += accent * 0.50 * glowA;
-		color += accent.zxy * 0.16 * glowB;
+		// Deep navy, lit from behind the row in the accent colour
+		color = mix(vec3(0.031, 0.047, 0.078), vec3(0.035, 0.070, 0.150), (1.0 - inUV.y) * 0.8); // #080C14 rising to a deeper blue
+		color += accent * 0.55 * glowA;
+		color += accent * vec3(0.55, 0.75, 1.0) * 0.22 * glowB;
+		// Soft rays fanning up from behind the selected cover
+		vec2 c = inUV - vec2(0.5, horizon - 0.08);
+		float ang = atan(c.x, -c.y);
+		float rays = pow(0.5 + 0.5 * sin(ang * 9.0 + t * 0.15), 6.0) * exp(-length(c) * 2.2) * smoothstep(0.0, -0.1, c.y);
+		color += accent * 0.10 * rays;
 	}
 	// The floor below the horizon is darker, with a faint line of light along it
 	color *= mix(1.0, 0.5, smoothstep(horizon - 0.005, horizon + 0.08, inUV.y));

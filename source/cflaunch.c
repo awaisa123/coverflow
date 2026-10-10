@@ -83,6 +83,7 @@
 #include <netdb.h>
 #include <sys/mount.h>
 #include <time.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -390,9 +391,19 @@ static int start_title(const char *title, const char **name, uint32_t *code, cha
 }
 
 // A title id is nine characters, as the console's own routes require.
+// Four capital letters and five digits, nothing else: a title id is used in
+// paths under /data/homebrew, so "../" and the like must never get through.
 static int valid_title(const char *title)
 {
-    return title != NULL && strlen(title) == PS5VKCTL_TITLE;
+    if (title == NULL || strlen(title) != PS5VKCTL_TITLE)
+        return 0;
+    for (int i = 0; i < 4; i++)
+        if (title[i] < 'A' || title[i] > 'Z')
+            return 0;
+    for (int i = 4; i < 9; i++)
+        if (title[i] < '0' || title[i] > '9')
+            return 0;
+    return 1;
 }
 
 
@@ -928,6 +939,9 @@ static int g_watch_return;
 static int g_watch_idle;
 static long long g_watch_started;
 static int g_watch_closed;
+static uint32_t g_watch_app = PS5VKCTL_NO_APP; // the game's app id, to see its processes go
+static int g_watch_tries;
+static int g_watch_gone_wait;
 
 static void watch_start(const char *game, const char *home, int come_back)
 {
@@ -937,6 +951,11 @@ static void watch_start(const char *game, const char *home, int come_back)
     g_watch_idle = 0;
     g_watch_closed = 0;
     g_watch_started = (long long)time(NULL);
+    g_watch_tries = 0;
+    g_watch_gone_wait = 0;
+    char running[32] = {0};
+    const uint32_t app = running_app(running, sizeof(running));
+    g_watch_app = app != PS5VKCTL_NO_APP && strncmp(running, game, PS5VKCTL_TITLE) == 0 ? app : PS5VKCTL_NO_APP;
     log_line("cflaunch: timing %s%s%s", game, come_back ? "; will bring back " : "", come_back ? home : "");
 }
 
@@ -972,18 +991,60 @@ static void watch_tick(void)
         g_watch_game[0] = '\0';
         return;
     }
-    // The game has closed: after two idle seconds, start Cover Flow again
-    if (++g_watch_idle < 2)
+    // The game has closed. Starting a title while the last one is still
+    // shutting down fails (and hammering it froze the console once), so wait
+    // until the game's processes are gone (at most 20 s), then 3 more seconds.
+    if (g_watch_app != PS5VKCTL_NO_APP && g_watch_gone_wait < 20)
+    {
+        int pids[PS5VKCTL_MAX_PIDS];
+        if (app_pids(g_watch_app, pids, PS5VKCTL_MAX_PIDS) > 0)
+        {
+            g_watch_gone_wait++;
+            g_watch_idle = 0;
+            return;
+        }
+    }
+    if (++g_watch_idle < 3)
         return;
     const char *name = NULL;
     uint32_t code = 0;
     char detail[160] = {0};
+    g_watch_tries++;
     const int started = start_title(g_watch_home, &name, &code, detail, sizeof(detail));
-    log_line("cflaunch: %s closed; starting %s: %s %s", g_watch_game, g_watch_home, started == 0 ? "ok" : "failed", detail);
+    // Believe the console, not the call: is Cover Flow really up now?
+    running[0] = 0;
+    bool up = false;
+    for (int wait = 0; wait < 24 && !up; wait++)
+    {
+        up = running_app(running, sizeof(running)) != PS5VKCTL_NO_APP && strncmp(running, g_watch_home, PS5VKCTL_TITLE) == 0;
+        if (!up)
+            usleep(250000);
+    }
+    log_line("cflaunch: %s closed; starting %s (try %d): call %s 0x%08x, %s %s", g_watch_game, g_watch_home, g_watch_tries,
+             started == 0 ? "ok" : "failed", code, up ? "running" : "NOT running", detail);
+    if (!up && g_watch_tries < 2)
+    {
+        g_watch_idle = -5; // one more try, about 8 s later
+        return;
+    }
     g_watch_game[0] = '\0';
 }
 
 // ----------------------------------------------------------------- artwork, storage, backup, log
+
+static int send_art_file(int client, const char *path)
+{
+    size_t size = 0;
+    char *const data = read_file(path, 24 << 20, &size);
+    if (data == NULL)
+        return -1;
+    char head[32];
+    const int len = snprintf(head, sizeof(head), "ok %zu\n", size);
+    if (send_all(client, head, (size_t)len) == 0)
+        send_all(client, data, size);
+    free(data);
+    return (int)(size > 0 ? 0 : -1);
+}
 
 static void send_art(int client, const char *id)
 {
@@ -993,22 +1054,46 @@ static void send_art(int client, const char *id)
         return;
     }
     static const char *const names[] = {"pic1.png", "pic0.png", "pic1.jpg", "pic0.jpg", "pic2.png"};
+    char path[256];
+    // The console's copy first, then the game's own sce_sys folder
     for (size_t r = 0; r < sizeof(meta_roots) / sizeof(meta_roots[0]); r++)
         for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++)
         {
-            char path[256];
             snprintf(path, sizeof(path), "%s/%s/%s", meta_roots[r], id, names[n]);
-            size_t size = 0;
-            char *const data = read_file(path, 24 << 20, &size);
-            if (data == NULL)
-                continue;
-            char head[32];
-            const int len = snprintf(head, sizeof(head), "ok %zu\n", size);
-            if (send_all(client, head, (size_t)len) == 0)
-                send_all(client, data, size);
-            free(data);
-            return;
+            if (send_art_file(client, path) == 0)
+            {
+                log_line("cflaunch: art %s from %s", id, path);
+                return;
+            }
         }
+    const char *const *groups[] = {app_roots, homebrew_roots};
+    const size_t counts[] = {sizeof(app_roots) / sizeof(app_roots[0]), sizeof(homebrew_roots) / sizeof(homebrew_roots[0])};
+    for (size_t g = 0; g < 2; g++)
+        for (size_t r = 0; r < counts[g]; r++)
+            for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++)
+            {
+                snprintf(path, sizeof(path), "%s/%s/sce_sys/%s", groups[g][r], id, names[n]);
+                if (send_art_file(client, path) == 0)
+                {
+                    log_line("cflaunch: art %s from %s", id, path);
+                    return;
+                }
+            }
+    // Nothing: say what the console's folder does hold, once, for the log
+    char seen[200] = {0};
+    snprintf(path, sizeof(path), "%s/%s", meta_roots[0], id);
+    DIR *const dir = opendir(path);
+    if (dir != NULL)
+    {
+        for (struct dirent *e; (e = readdir(dir)) != NULL;)
+            if (e->d_name[0] != '.' && strlen(seen) + strlen(e->d_name) + 2 < sizeof(seen))
+            {
+                strcat(seen, e->d_name);
+                strcat(seen, " ");
+            }
+        closedir(dir);
+    }
+    log_line("cflaunch: no art for %s (%s holds: %s)", id, path, seen[0] ? seen : "nothing readable");
     reply(client, "err no art for %s", id);
 }
 
@@ -1051,6 +1136,8 @@ static void backup_paths(const char *title, char from[3][192], const char *names
     snprintf(from[2], 192, "%s", PLAYTIME_FILE);
 }
 
+static void fix_title_files(int client, const char *title);
+
 static void backup_or_restore(int client, const char *title, int restore)
 {
     if (!valid_title(title))
@@ -1079,6 +1166,8 @@ static void backup_or_restore(int client, const char *title, int restore)
                 done++;
         }
         log_line("cflaunch: %s %s: %d files", restore ? "restored from" : "backed up to", folder, done);
+        if (restore)
+            fix_title_files(-1, title); // copied as root: let Cover Flow write them again
         if (done == 0 && !restore)
         {
             reply(client, "err could not write to %s", folder);
@@ -1088,6 +1177,108 @@ static void backup_or_restore(int client, const char *title, int restore)
         return;
     }
     reply(client, restore ? "err no USB drive with a CoverFlowBackup folder" : "err no USB drive found");
+}
+
+// USB covers and names into Cover Flow's own folder (covers/custom/). Only
+// images named by a title id and a names.txt are taken; nothing else is read.
+static void import_covers(int client, const char *title)
+{
+    if (!valid_title(title))
+    {
+        reply(client, "err usage: import <TITLEID>");
+        return;
+    }
+    char custom[128];
+    snprintf(custom, sizeof(custom), "/data/homebrew/%s/covers/custom", title);
+    for (int u = 0; u < 8; u++)
+    {
+        char folder[64];
+        snprintf(folder, sizeof(folder), "/mnt/usb%d/CoverFlowCovers", u);
+        DIR *const dir = opendir(folder);
+        if (dir == NULL)
+            continue;
+        char covers[96];
+        snprintf(covers, sizeof(covers), "/data/homebrew/%s/covers", title);
+        mkdir(covers, 0777);
+        mkdir(custom, 0777);
+        int images = 0, names = 0, skipped = 0;
+        for (struct dirent *e; (e = readdir(dir)) != NULL;)
+        {
+            const char *const dot = strrchr(e->d_name, '.');
+            if (dot == NULL || dot - e->d_name != 9)
+                continue;
+            char id[10];
+            memcpy(id, e->d_name, 9);
+            id[9] = '\0';
+            char ext[8] = {0};
+            for (int i = 0; dot[i] != '\0' && i < 7; i++)
+                ext[i] = (char)tolower((unsigned char)dot[i]);
+            if (!is_title_id(id) || (strcmp(ext, ".png") != 0 && strcmp(ext, ".jpg") != 0 && strcmp(ext, ".jpeg") != 0))
+                continue;
+            char from[256], to[256];
+            snprintf(from, sizeof(from), "%s/%s", folder, e->d_name);
+            struct stat st;
+            if (stat(from, &st) != 0 || st.st_size <= 0 || st.st_size > (8 << 20))
+            {
+                skipped++;
+                continue;
+            }
+            // One cover per game: drop the other kinds first
+            static const char *const kinds[] = {".png", ".jpg", ".jpeg", ".PNG", ".JPG"};
+            for (size_t k = 0; k < sizeof(kinds) / sizeof(kinds[0]); k++)
+            {
+                snprintf(to, sizeof(to), "%s/%s%s", custom, id, kinds[k]);
+                unlink(to);
+            }
+            snprintf(to, sizeof(to), "%s/%s%s", custom, id, ext);
+            if (copy_file(from, to) == 0)
+                images++;
+            else
+                skipped++;
+        }
+        closedir(dir);
+        char from[256], to[256];
+        snprintf(from, sizeof(from), "%s/names.txt", folder);
+        snprintf(to, sizeof(to), "%s/names-import.txt", custom);
+        size_t size = 0;
+        char *const text = read_file(from, 1 << 20, &size);
+        if (text != NULL)
+        {
+            for (size_t i = 0; i < size; i++)
+                if (text[i] == '|')
+                    names++;
+            free(text);
+            if (copy_file(from, to) != 0)
+                names = 0;
+        }
+        fix_title_files(-1, title);
+        log_line("cflaunch: imported %d covers and %d names from %s (%d skipped)", images, names, folder, skipped);
+        reply(client, "ok import %d %d %s", images, names, folder);
+        return;
+    }
+    reply(client, "err no USB drive with a CoverFlowCovers folder");
+}
+
+// Free space on each drive that is there, on one line:
+// "ok drives Internal|free|total;USB 1|free|total"
+static void send_drives(int client)
+{
+    static const char *const paths[] = {"/user", "/mnt/ext0", "/mnt/ext1", "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3"};
+    static const char *const labels[] = {"Internal", "Extended", "Extended 2", "USB 1", "USB 2", "USB 3", "USB 4"};
+    char line[512] = "ok drives ";
+    int count = 0;
+    for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+    {
+        struct statfs fs;
+        if (!is_folder(paths[i]) || statfs(paths[i], &fs) != 0 || fs.f_blocks == 0)
+            continue;
+        char entry[96];
+        snprintf(entry, sizeof(entry), "%s%s|%lld|%lld", count ? ";" : "", labels[i],
+                 (long long)fs.f_bavail * (long long)fs.f_bsize, (long long)fs.f_blocks * (long long)fs.f_bsize);
+        strncat(line, entry, sizeof(line) - strlen(line) - 1);
+        count++;
+    }
+    reply(client, "%s", line);
 }
 
 static void send_log(int client)
@@ -1590,6 +1781,7 @@ static void update_check(int client, const char *repo)
 
 #define UPDATE_MAX_FILES 64
 
+
 static void update_apply(int client, const char *repo, const char *title)
 {
     if (!valid_repo(repo) || !valid_title(title))
@@ -1709,8 +1901,365 @@ static void update_apply(int client, const char *repo, const char *title)
             return;
         }
     }
+    fix_title_files(-1, title);
     log_line("cflaunch: installed %s %s (%d files) into %s", repo, tag, fetched, folder);
     reply(client, "ok %s %d", tag, fetched);
+}
+
+// Files written from inside Cover Flow come out -rw-rw-rw- and owned by the app;
+// the console will not start an eboot.bin like that (CE-107750-0). Give the
+// title's files what an FTP upload gives them: rwxrwxrwx, owned by root.
+static int fix_tree(const char *path, int depth, int *budget, int *failed)
+{
+    int fixed = 0;
+    DIR *const dir = opendir(path);
+    if (dir == NULL)
+        return 0;
+    for (struct dirent *e; (e = readdir(dir)) != NULL && *budget > 0;)
+    {
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+            continue;
+        (*budget)--;
+        char child[512];
+        snprintf(child, sizeof(child), "%s/%s", path, e->d_name);
+        struct stat st;
+        if (lstat(child, &st) != 0 || S_ISLNK(st.st_mode))
+            continue;
+        if ((st.st_mode & 0777) != 0777 && chmod(child, 0777) != 0)
+            (*failed)++;
+        else if (st.st_uid != 0 && chown(child, 0, 0) != 0)
+            (*failed)++;
+        else
+            fixed++;
+        if (S_ISDIR(st.st_mode) && depth < 6)
+            fixed += fix_tree(child, depth + 1, budget, failed);
+    }
+    closedir(dir);
+    return fixed;
+}
+
+static void fix_title_files(int client, const char *title)
+{
+    // Only a real title id: never a path that could leave /data/homebrew
+    if (title == NULL || !valid_title(title))
+    {
+        if (client >= 0)
+            reply(client, "err usage: fixperms <TITLEID>");
+        return;
+    }
+    char folder[96];
+    snprintf(folder, sizeof(folder), "/data/homebrew/%s", title);
+    int budget = 20000, failed = 0;
+    const int fixed = fix_tree(folder, 0, &budget, &failed);
+    char eboot[160];
+    snprintf(eboot, sizeof(eboot), "%s/eboot.bin", folder);
+    struct stat st;
+    const int found = stat(eboot, &st) == 0;
+    const int ok = found && (st.st_mode & 0111) != 0;
+    log_line("cflaunch: fixperms %s: %d entries checked, %d failed, eboot.bin %s (mode %o, uid %d)", folder, fixed, failed,
+             ok ? "executable" : "NOT executable", found ? (unsigned)(st.st_mode & 0777) : 0u, found ? (int)st.st_uid : -1);
+    if (client >= 0)
+    {
+        if (ok)
+            reply(client, "ok fixperms %d %d", fixed, failed);
+        else
+            reply(client, "err eboot.bin is still not executable (%d failed)", failed);
+    }
+}
+
+// ----------------------------------------------------------------- the backup wizard
+// Cover Flow drives a backup or restore one file at a time, so it can show
+// real progress and stop between files. Only Cover Flow's own files ever
+// move: its settings, its games list, the play-time file and covers/custom/.
+// Nothing else on the console or the USB drive is read, written or listed.
+
+#define BACKUP_FOLDER "CoverFlowBackup"
+
+// "usb0".."usb7" -> "/mnt/usbN/CoverFlowBackup"
+static int backup_folder(const char *drive, char *out, size_t size)
+{
+    if (drive == NULL || strlen(drive) != 4 || strncmp(drive, "usb", 3) != 0 || drive[3] < '0' || drive[3] > '7')
+        return -1;
+    snprintf(out, size, "/mnt/%s/" BACKUP_FOLDER, drive);
+    return 0;
+}
+
+// A file the wizard may move, by its name inside the backup; its place on the console
+static int backup_item(const char *title, const char *item, char *console, size_t size)
+{
+    if (item == NULL)
+        return -1;
+    if (strcmp(item, "coverflow.ini") == 0)
+        snprintf(console, size, "/data/homebrew/%s/coverflow.ini", title);
+    else if (strcmp(item, "games.txt") == 0)
+        snprintf(console, size, "/data/homebrew/%s/covers/games.txt", title);
+    else if (strcmp(item, "playtime.txt") == 0)
+        snprintf(console, size, "%s", PLAYTIME_FILE);
+    else if (strcmp(item, "custom/names.txt") == 0)
+        snprintf(console, size, "/data/homebrew/%s/covers/custom/names.txt", title);
+    else
+    {
+        // custom/<TITLEID>.png|.jpg|.jpeg and nothing else
+        if (strncmp(item, "custom/", 7) != 0)
+            return -1;
+        const char *const name = item + 7;
+        const char *const dot = strchr(name, '.');
+        char id[10];
+        if (dot == NULL || dot - name != 9)
+            return -1;
+        memcpy(id, name, 9);
+        id[9] = '\0';
+        if (!valid_title(id) || (strcmp(dot, ".png") != 0 && strcmp(dot, ".jpg") != 0 && strcmp(dot, ".jpeg") != 0))
+            return -1;
+        snprintf(console, size, "/data/homebrew/%s/covers/custom/%s", title, name);
+    }
+    return 0;
+}
+
+static int file_hash(const char *path, char hex[65], long long *bytes)
+{
+    size_t size = 0;
+    char *const data = read_file(path, 24 << 20, &size);
+    if (data == NULL)
+        return -1;
+    sha256_t c;
+    sha256_init(&c);
+    sha256_update(&c, data, size);
+    sha256_hex(&c, hex);
+    free(data);
+    *bytes = (long long)size;
+    return 0;
+}
+
+// Copy, then read both back and compare: "ok <bytes>" only for an exact copy
+static void copy_checked(int client, const char *from, const char *to)
+{
+    char a[65], b[65];
+    long long na = 0, nb = 0;
+    if (file_hash(from, a, &na) != 0)
+    {
+        reply(client, "err cannot read %s", from);
+        return;
+    }
+    make_parents(to);
+    if (copy_file(from, to) != 0 || file_hash(to, b, &nb) != 0 || na != nb || strcmp(a, b) != 0)
+    {
+        unlink(to);
+        reply(client, "err the copy of %s did not check out", from);
+        return;
+    }
+    reply(client, "ok %lld", na);
+}
+
+static long long playtime_total(const char *path)
+{
+    size_t size = 0;
+    char *const text = read_file(path, 1 << 20, &size);
+    long long total = 0;
+    if (text == NULL)
+        return 0;
+    for (char *line = strtok(text, "\n"); line != NULL; line = strtok(NULL, "\n"))
+    {
+        char id[16];
+        long long seconds = 0;
+        if (sscanf(line, "%15s %lld", id, &seconds) == 2 && seconds > 0)
+            total += seconds;
+    }
+    free(text);
+    return total;
+}
+
+// One line: "ok backups usb0|free|total|state|date|covers|names|playseconds;usb1|..."
+// state: none, complete, incomplete (begun, never finished) or old (before v18)
+static void list_backups(int client)
+{
+    char line[1024] = "ok backups ";
+    int count = 0;
+    for (int u = 0; u < 8; u++)
+    {
+        char drive[8], mount[32], folder[64], path[128];
+        snprintf(drive, sizeof(drive), "usb%d", u);
+        snprintf(mount, sizeof(mount), "/mnt/%s", drive);
+        struct statfs fs;
+        if (!is_folder(mount) || statfs(mount, &fs) != 0 || fs.f_blocks == 0)
+            continue;
+        backup_folder(drive, folder, sizeof(folder));
+        const char *state = "none";
+        long long date = 0, covers = 0, names = 0, seconds = 0;
+        snprintf(path, sizeof(path), "%s/manifest.txt", folder);
+        size_t size = 0;
+        char *const manifest = read_file(path, 4096, &size);
+        if (manifest != NULL)
+        {
+            state = "complete";
+            for (char *l = strtok(manifest, "\n"); l != NULL; l = strtok(NULL, "\n"))
+            {
+                (void)sscanf(l, "date %lld", &date);
+                (void)sscanf(l, "covers %lld", &covers);
+                (void)sscanf(l, "names %lld", &names);
+                (void)sscanf(l, "playtime %lld", &seconds);
+            }
+            free(manifest);
+        }
+        else
+        {
+            snprintf(path, sizeof(path), "%s/incomplete.txt", folder);
+            struct stat st;
+            if (stat(path, &st) == 0)
+                state = "incomplete";
+            else
+            {
+                snprintf(path, sizeof(path), "%s/coverflow.ini", folder);
+                if (stat(path, &st) == 0)
+                {
+                    state = "old";
+                    date = (long long)st.st_mtime;
+                    snprintf(path, sizeof(path), "%s/playtime.txt", folder);
+                    seconds = playtime_total(path);
+                }
+            }
+        }
+        char entry[160];
+        snprintf(entry, sizeof(entry), "%s%s|%lld|%lld|%s|%lld|%lld|%lld|%lld", count ? ";" : "", drive,
+                 (long long)fs.f_bavail * (long long)fs.f_bsize, (long long)fs.f_blocks * (long long)fs.f_bsize,
+                 state, date, covers, names, seconds);
+        strncat(line, entry, sizeof(line) - strlen(line) - 1);
+        count++;
+    }
+    reply(client, "%s", line);
+}
+
+// The files a backup on this drive holds, for a restore: "ok files a;b;c"
+static void list_backup_files(int client, const char *drive)
+{
+    char folder[64];
+    if (backup_folder(drive, folder, sizeof(folder)) != 0)
+    {
+        reply(client, "err usage: backup-files usbN");
+        return;
+    }
+    static char line[16384];
+    snprintf(line, sizeof(line), "ok files ");
+    int count = 0;
+    static const char *const fixed[] = {"coverflow.ini", "games.txt", "playtime.txt", "custom/names.txt"};
+    char path[256], console[256];
+    for (size_t i = 0; i < sizeof(fixed) / sizeof(fixed[0]); i++)
+    {
+        snprintf(path, sizeof(path), "%s/%s", folder, fixed[i]);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 0)
+        {
+            snprintf(path, sizeof(path), "%s%s", count++ ? ";" : "", fixed[i]);
+            strncat(line, path, sizeof(line) - strlen(line) - 1);
+        }
+    }
+    snprintf(path, sizeof(path), "%s/custom", folder);
+    DIR *const dir = opendir(path);
+    if (dir != NULL)
+    {
+        for (struct dirent *e; (e = readdir(dir)) != NULL;)
+        {
+            char item[64];
+            snprintf(item, sizeof(item), "custom/%s", e->d_name);
+            if (strcmp(e->d_name, "names.txt") == 0 || backup_item("PPSA00000", item, console, sizeof(console)) != 0)
+                continue;
+            snprintf(path, sizeof(path), "%s%s", count++ ? ";" : "", item);
+            if (strlen(line) + strlen(path) + 1 < sizeof(line))
+                strcat(line, path);
+        }
+        closedir(dir);
+    }
+    reply(client, "%s", line);
+}
+
+// backup-begin TITLE usbN: mark the backup as under way and clear its old covers
+static void backup_begin(int client, const char *title, const char *drive)
+{
+    char folder[64], path[256];
+    if (!valid_title(title) || backup_folder(drive, folder, sizeof(folder)) != 0)
+    {
+        reply(client, "err usage: backup-begin TITLEID usbN");
+        return;
+    }
+    snprintf(path, sizeof(path), "/mnt/%s", drive);
+    if (!is_folder(path))
+    {
+        reply(client, "err no USB drive at %s", path);
+        return;
+    }
+    mkdir(folder, 0777);
+    snprintf(path, sizeof(path), "%s/manifest.txt", folder);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/incomplete.txt", folder);
+    FILE *const mark = fopen(path, "w");
+    if (mark == NULL)
+    {
+        reply(client, "err cannot write to %s: %s", folder, strerror(errno));
+        return;
+    }
+    fprintf(mark, "A Cover Flow backup was started here and did not finish.\n");
+    fclose(mark);
+    // Covers removed since the last backup must not come back: drop the old ones
+    // (only names the wizard itself writes)
+    snprintf(path, sizeof(path), "%s/custom", folder);
+    DIR *const dir = opendir(path);
+    if (dir != NULL)
+    {
+        char console[256], item[64], file[256];
+        for (struct dirent *e; (e = readdir(dir)) != NULL;)
+        {
+            snprintf(item, sizeof(item), "custom/%s", e->d_name);
+            if (backup_item(title, item, console, sizeof(console)) == 0)
+            {
+                snprintf(file, sizeof(file), "%s/%s", folder, item);
+                unlink(file);
+            }
+        }
+        closedir(dir);
+    }
+    reply(client, "ok begun %s", folder);
+}
+
+// backup-file / restore-file TITLE usbN ITEM
+static void backup_or_restore_file(int client, const char *title, const char *drive, const char *item, int restore)
+{
+    char folder[64], console[256], usb[256];
+    if (!valid_title(title) || backup_folder(drive, folder, sizeof(folder)) != 0 ||
+        backup_item(title, item, console, sizeof(console)) != 0)
+    {
+        reply(client, "err not a file the backup holds");
+        return;
+    }
+    snprintf(usb, sizeof(usb), "%s/%s", folder, item);
+    if (restore)
+        copy_checked(client, usb, console);
+    else
+        copy_checked(client, console, usb);
+}
+
+// backup-finish TITLE usbN COVERS NAMES: the manifest says it is whole
+static void backup_finish(int client, const char *title, const char *drive, const char *covers, const char *names)
+{
+    char folder[64], path[256];
+    if (!valid_title(title) || backup_folder(drive, folder, sizeof(folder)) != 0)
+    {
+        reply(client, "err usage: backup-finish TITLEID usbN COVERS NAMES");
+        return;
+    }
+    snprintf(path, sizeof(path), "%s/manifest.txt", folder);
+    FILE *const file = fopen(path, "w");
+    if (file == NULL)
+    {
+        reply(client, "err cannot write the manifest: %s", strerror(errno));
+        return;
+    }
+    fprintf(file, "Cover Flow backup\ntitle %s\ndate %lld\ncovers %d\nnames %d\nplaytime %lld\n", title,
+            (long long)time(NULL), covers ? atoi(covers) : 0, names ? atoi(names) : 0, playtime_total(PLAYTIME_FILE));
+    fclose(file);
+    snprintf(path, sizeof(path), "%s/incomplete.txt", folder);
+    unlink(path);
+    log_line("cflaunch: backup to %s complete", folder);
+    reply(client, "ok finished %s", folder);
 }
 
 // Answer one command. Returns 0 to keep serving, -1 to leave the console.
@@ -1725,7 +2274,7 @@ static int handle_command(int client, char *line)
     const char *const title = strtok(NULL, " \t");
     if (strcmp(command, "ping") == 0)
     {
-        reply(client, "ok cflaunch 8 pid=%d", (int)getpid());
+        reply(client, "ok cflaunch 12 pid=%d", (int)getpid());
         return 0;
     }
     if (strcmp(command, "status") == 0)
@@ -1792,6 +2341,49 @@ static int handle_command(int client, char *line)
     if (strcmp(command, "storage") == 0)
     {
         send_storage(client);
+        return 0;
+    }
+    if (strcmp(command, "backups") == 0)
+    {
+        list_backups(client);
+        return 0;
+    }
+    if (strcmp(command, "backup-files") == 0)
+    {
+        list_backup_files(client, title);
+        return 0;
+    }
+    if (strcmp(command, "backup-begin") == 0)
+    {
+        backup_begin(client, title, strtok(NULL, " \t"));
+        return 0;
+    }
+    if (strcmp(command, "backup-file") == 0 || strcmp(command, "restore-file") == 0)
+    {
+        const char *const drive = strtok(NULL, " \t");
+        backup_or_restore_file(client, title, drive, strtok(NULL, " \t"), strcmp(command, "restore-file") == 0);
+        return 0;
+    }
+    if (strcmp(command, "backup-finish") == 0)
+    {
+        const char *const drive = strtok(NULL, " \t");
+        const char *const covers = strtok(NULL, " \t");
+        backup_finish(client, title, drive, covers, strtok(NULL, " \t"));
+        return 0;
+    }
+    if (strcmp(command, "drives") == 0)
+    {
+        send_drives(client);
+        return 0;
+    }
+    if (strcmp(command, "import") == 0)
+    {
+        import_covers(client, title);
+        return 0;
+    }
+    if (strcmp(command, "fixperms") == 0)
+    {
+        fix_title_files(client, title);
         return 0;
     }
     if (strcmp(command, "backup") == 0 || strcmp(command, "restore") == 0)
@@ -1995,15 +2587,17 @@ int main(int argc, char *argv[])
     struct sockaddr_in address;
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_ANY);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // Cover Flow is on the same console: nothing on the network may send commands
     address.sin_port = htons((uint16_t)port);
-    // An older launcher still holding the port is asked to leave ("quit"),
-    // then the port is tried again, a few times
-    int bound = bind(server, (struct sockaddr *)&address, sizeof(address));
-    for (int attempt = 0; bound != 0 && errno == EADDRINUSE && attempt < 5; attempt++)
+    // An older launcher is asked to leave ("quit") before this one binds: older
+    // ones listened on every address, so binding to loopback alone could
+    // otherwise succeed beside them and leave two running. Then the port is
+    // tried, a few times.
+    int bound = -1;
+    for (int attempt = 0; attempt < 6; attempt++)
     {
-        log_line("cflaunch: port %u is taken: asking the running launcher to quit", port);
         const int old = socket(AF_INET, SOCK_STREAM, 0);
+        int asked = 0;
         if (old >= 0)
         {
             struct sockaddr_in local;
@@ -2013,14 +2607,23 @@ int main(int argc, char *argv[])
             local.sin_port = htons((uint16_t)port);
             if (connect(old, (struct sockaddr *)&local, sizeof(local)) == 0)
             {
+                log_line("cflaunch: a launcher is running on port %u: asking it to quit", port);
                 (void)send(old, "quit\n", 5, 0);
                 char answer[64];
                 (void)recv(old, answer, sizeof(answer), 0);
+                asked = 1;
             }
             close(old);
         }
-        sleep(2);
+        if (asked)
+        {
+            sleep(2);
+            continue;
+        }
         bound = bind(server, (struct sockaddr *)&address, sizeof(address));
+        if (bound == 0 || errno != EADDRINUSE)
+            break;
+        sleep(2);
     }
     if (bound != 0 || listen(server, 4) != 0)
     {
@@ -2028,7 +2631,7 @@ int main(int argc, char *argv[])
         close(server);
         return 1;
     }
-    log_line("cflaunch 8: listening");
+    log_line("cflaunch 12: listening");
     for (;;)
     {
         struct pollfd ready = {server, POLLIN, 0};

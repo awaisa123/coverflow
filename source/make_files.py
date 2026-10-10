@@ -11,6 +11,8 @@ files = [
     ("shaders/glsl/coverflow/background.vert.spv", "shaders/glsl/coverflow/background.vert.spv"),
     ("shaders/glsl/coverflow/background.frag.spv", "shaders/glsl/coverflow/background.frag.spv"),
     ("ps5/sce_sys/icon0.png", "sce_sys/icon0.png"),
+    # The bold face for headings: an in-app update only replaces eboot.bin, so it travels inside it
+    ("examples/coverflow/assets/Roboto-Bold.ttf", "assets/Roboto-Bold.ttf"),
 ]
 out = ["// Made by make_files.py - do not edit", "#pragma once", "",
        "struct EmbeddedFile {", "\tconst char *path;", "\tconst unsigned char *data;", "\tsize_t size;", "};", ""]
