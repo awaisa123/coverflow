@@ -3657,12 +3657,13 @@ public:
 		if (menuOpen && dumpOpen) {
 			// The external PS5 App Dumper reports real byte progress off the render thread.
 			if (dumpStage == 2 && dumpJob) {
-				bool done = false, success = false;
+				bool done = false, success = false, queued = false;
 				std::string answer, stage;
 				{
 					std::lock_guard<std::mutex> lock(dumpJob->mutex);
 					done = dumpJob->done;
 					success = dumpJob->success;
+					queued = dumpJob->queued;
 					dumpProgress = dumpJob->progress;
 					answer = dumpJob->answer;
 					stage = dumpJob->stage;
@@ -3671,7 +3672,7 @@ public:
 				if (done) {
 					dumpResult = answer;
 					dumpSucceeded = success;
-					dumpQueued = dumpJob->queued;
+					dumpQueued = queued;
 					dumpProgress = dumpSucceeded ? (dumpQueued ? 0.0f : 1.0f) : dumpProgress;
 					dumpJob.reset();
 					dumpStage = 3;
