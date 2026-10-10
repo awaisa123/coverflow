@@ -1,0 +1,107 @@
+[
+ {
+  "id": "title",
+  "name": "Cover Flow: its program, the foundation (Sascha Willems' Vulkan examples and base class, the PS5 layer) and the libraries in its tree (Dear ImGui, libktx, tinygltf with stb_image and nlohmann json, volk, the Vulkan headers, glm)",
+  "licence": "MIT (the title, the examples, Dear ImGui, tinygltf, volk, glm); Apache-2.0 (libktx); Apache-2.0 OR MIT (the Vulkan headers)",
+  "copyright": [
+   "Copyright (c) 2016-2026 Sascha Willems",
+   "Copyright (C) 2026 Mihawk",
+   "and each library's authors"
+  ],
+  "artifacts": [
+   "eboot.bin",
+   "shaders/"
+  ],
+  "texts": "licenses/title/",
+  "source": {
+   "kind": "git",
+   "path": "/tmp/claude-0/-home-claude/f4f2c94e-f391-583c-a2da-835e0a8dc8b8/scratchpad/ps5vk/PS5_CoverFlow",
+   "remote": "(no remote yet)",
+   "revision": "9d19275be13c8b85013092e8b3ef8139bebbdba4",
+   "dirty": true,
+   "submodules": {
+    "external/glm": {
+     "remote": "https://github.com/g-truc/glm",
+     "revision": "8f0c61bfd0e54052a8b22d736cd1ea0e751267d8"
+    }
+   }
+  }
+ },
+ {
+  "id": "platform",
+  "name": "the PS5 platform layer (libps5platform.a) and the SDK headers, from my payload SDK fork, with musl's regex and dlmalloc",
+  "licence": "GPL-3.0-or-later; musl's regex MIT; dlmalloc public domain",
+  "copyright": [
+   "Copyright (C) John Törnblom and the ps5-payload-dev contributors",
+   "Copyright (C) 2026 Mihawk"
+  ],
+  "artifacts": [
+   "eboot.bin"
+  ],
+  "texts": "licenses/platform/",
+  "source": {
+   "kind": "git",
+   "path": "/tmp/claude-0/-home-claude/f4f2c94e-f391-583c-a2da-835e0a8dc8b8/scratchpad/ps5vk/PS5_PayloadSDK",
+   "remote": "https://github.com/mihawk-99/PS5_PayloadSDK",
+   "revision": "611893fc25ef3e138f5bc2c90d829d8b58174cd2",
+   "dirty": false
+  }
+ },
+ {
+  "id": "ps5-vulkan",
+  "name": "PS5_Vulkan: the RADV link recipe, the C runtime start-up, the AGC import stubs and sce_module/libc.prx",
+  "licence": "GPL-3.0-or-later",
+  "copyright": [
+   "Copyright (C) 2026 Mihawk"
+  ],
+  "artifacts": [
+   "eboot.bin",
+   "sce_module/libc.prx"
+  ],
+  "texts": "licenses/ps5-vulkan/",
+  "source": {
+   "kind": "git",
+   "path": "/tmp/claude-0/-home-claude/f4f2c94e-f391-583c-a2da-835e0a8dc8b8/scratchpad/ps5vk/PS5_Vulkan",
+   "remote": "https://github.com/mihawk-99/PS5_Vulkan",
+   "revision": "5b5e4fc2d80fdb67a4f61ba9e6a8a424026bb8a5",
+   "dirty": false
+  }
+ },
+ {
+  "id": "radv",
+  "name": "RADV, Mesa's Vulkan driver (with ACO, NIR and Mesa's Vulkan runtime), from my PS5_Mesa fork",
+  "licence": "MIT, with other licences stated per file (licenses/radv/Mesa-license.rst)",
+  "copyright": [
+   "Copyright the Mesa contributors (per-file notices in the source)"
+  ],
+  "artifacts": [
+   "eboot.bin"
+  ],
+  "texts": "licenses/radv/",
+  "source": {
+   "kind": "git",
+   "path": "/tmp/claude-0/-home-claude/f4f2c94e-f391-583c-a2da-835e0a8dc8b8/scratchpad/ps5vk/PS5_Mesa",
+   "remote": "https://github.com/mihawk-99/PS5_Mesa",
+   "revision": "7b59ef27c1b09b9671bc4153c41940c3155c3af2",
+   "dirty": false,
+   "built_with_sdk": "b83202be73e930050e00de0f1b4d9ec46c0391bf"
+  }
+ },
+ {
+  "id": "llvm-runtime",
+  "name": "LLVM libc++, libc++abi, libunwind and compiler-rt builtins (linked into eboot.bin)",
+  "licence": "Apache-2.0 WITH LLVM-exception",
+  "copyright": [
+   "Copyright (c) 2003-2026 University of Illinois at Urbana-Champaign and the LLVM project contributors"
+  ],
+  "artifacts": [
+   "eboot.bin"
+  ],
+  "texts": "licenses/llvm-runtime/",
+  "source": {
+   "kind": "fixed",
+   "revision": "ps5-payload-dev SDK v0.42 release archives",
+   "url": "https://github.com/ps5-payload-dev/sdk/releases/tag/v0.42"
+  }
+ }
+]
