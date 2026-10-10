@@ -228,6 +228,10 @@ public:
 	std::string dumpResult;
 	bool dumpSucceeded{ false };
 	bool dumpQueued{ false };
+	std::shared_ptr<DumperProgress> dumpsJob;
+	std::vector<std::string> dumpEntries;
+	std::string dumpsMessage{ "Press Cross to refresh dump history." };
+	int dumpsIndex{ 0 };
 	int dumpIndex{ 0 };
 	int dumpDestination{ 0 }; // 0: internal storage, 1: USB drive
 	int dumpStage{ 0 }; // 0: destination, 1: confirmation, 2: dumping, 3: result
@@ -388,6 +392,43 @@ public:
 		return json.compare(p, 4, "true") == 0;
 	}
 
+	static std::vector<std::string> jsonObjectArray(const std::string &json, const std::string &key)
+	{
+		std::vector<std::string> objects;
+		const std::string needle = "\"" + key + "\":[";
+		size_t p = json.find(needle);
+		if (p == std::string::npos) return objects;
+		p += needle.size();
+		while (p < json.size() && json[p] != ']') {
+			if (json[p] == ',' || json[p] == ' ' || json[p] == '\\n' || json[p] == '\\r' || json[p] == '\\t') {
+				p++;
+				continue;
+			}
+			if (json[p] != '{') return {};
+			const size_t start = p;
+			int depth = 0;
+			bool inString = false, escaped = false;
+			for (; p < json.size(); p++) {
+				const char c = json[p];
+				if (inString) {
+					if (escaped) escaped = false;
+					else if (c == '\\\\') escaped = true;
+					else if (c == '"') inString = false;
+					continue;
+				}
+				if (c == '"') inString = true;
+				else if (c == '{') depth++;
+				else if (c == '}' && --depth == 0) {
+					p++;
+					objects.push_back(json.substr(start, p - start));
+					break;
+				}
+			}
+			if (depth != 0) return {};
+		}
+		return objects;
+	}
+
 	static std::string urlEncode(const std::string &value)
 	{
 		static const char hex[] = "0123456789ABCDEF";
@@ -490,10 +531,14 @@ public:
 		// A proper dump needs the selected title mounted. Cover Flow cannot stay
 		// on screen while the PS5 launches that game, so submit the dumper's own
 		// queue API; its worker launches/mounts the title and runs the dump.
-		const std::string form = "titles=" + urlEncode(titleId) +
+		// PS5 App Dumper's documented queue API takes title IDs in q0/q1...
+		// fields, not a "titles" field. Queueing means accepted for later work,
+		// never that the files have already been copied.
+		const std::string form = "q0=" + urlEncode(titleId) +
 			"&target=" + urlEncode(target) + "&replace=0";
 		const std::string response = dumperHttp(port, "POST", "/api/queue/start", form, 10);
-		if (response.find("\"started\":true") == std::string::npos) {
+		if (response.find("\"ok\":true") == std::string::npos &&
+			response.find("\"started\":true") == std::string::npos) {
 			std::string err = jsonString(response, "error");
 			if (err.empty()) err = response.empty() ?
 				"PS5 App Dumper did not accept the queue request." : response;
@@ -501,8 +546,40 @@ public:
 			return;
 		}
 		finishJob(true, true, "Queued",
-			"Dump queued for " + titleId + " at " + target +
-			". The dumper will launch the title; Cover Flow may close. Monitor progress in the PS5 App Dumper web interface.");
+			"Dump request accepted for " + titleId + " at " + target +
+			". This is only queue acceptance, not dump completion. Check the PS5 App Dumper status and its Dumps page for final results.");
+	}
+
+	void refreshDumpHistory()
+	{
+		if (dumpsJob) {
+			std::lock_guard<std::mutex> lock(dumpsJob->mutex);
+			if (!dumpsJob->done) {
+				dumpsMessage = "Refreshing dump history…";
+				return;
+			}
+		}
+		dumpsJob = std::make_shared<DumperProgress>();
+		dumpsMessage = "Connecting to PS5 App Dumper…";
+		const auto job = dumpsJob;
+		std::thread([job]() {
+			int port = findDumperPort();
+			if (!port) {
+				std::lock_guard<std::mutex> lock(job->mutex);
+				job->done = true;
+				job->success = false;
+				job->stage = "Dumper unavailable";
+				job->answer = "PS5 App Dumper is not running or its local API is unavailable.";
+				return;
+			}
+			const std::string response = dumperHttp(port, "GET", "/api/dumps", "", 8);
+			std::lock_guard<std::mutex> lock(job->mutex);
+			job->done = true;
+			job->success = response.find("\"dumps\":[") != std::string::npos;
+			job->stage = job->success ? "History loaded" : "History unavailable";
+			job->answer = response.empty() ? "The dumper returned no response." :
+				(job->success ? response : "The dumper did not return a dumps list. Check its API/version.");
+		}).detach();
 	}
 
 	std::shared_ptr<Pending> updateCheckJob, updateApplyJob;
