@@ -163,7 +163,7 @@ struct Sha256 {
 	}
 };
 
-static constexpr const char *coverFlowVersion = "v22";
+static constexpr const char *coverFlowVersion = "v24";
 static constexpr int launcherVersion = 12; // the launcher in the title folder
 
 class VulkanExample : public VulkanExampleBase
@@ -224,6 +224,12 @@ public:
 	int menuIndex{ 0 };
 	bool categoryOpen{ false }; // the category list inside the game menu
 	bool collectionsOpen{ false }; // the collections checklist inside the game menu
+	// The Game Manager (TRIANGLE): the selected game's actions, with its cover and details
+	bool managerOpen{ false };
+	int managerIndex{ 0 };
+	int managerPage{ 0 }; // 0 actions, 1 collections, 2 categories, 3 details, 10 cover actions
+	static constexpr int managerActions = 6;
+	int coverActionIndex{ 0 };
 	int collectionIndex{ 0 };
 	static constexpr int gridCols = 7;
 	float gridScroll{ 0.0f };     // the grid's row at the middle, sliding towards the selection's
@@ -248,7 +254,7 @@ public:
 		bool artBackgrounds{ true };
 		bool sounds{ true };
 		bool grid{ false };
-		int layout{ 0 }; // 0 Showcase (tall covers, gentle angle), 1 Classic
+		int layout{ 0 }; // 0 Dashboard (cards, v24), 1 Classic (square, steep), 2 Showcase (tall, gently turned)
 		std::string themeName; // a built-in theme, a folder in themes/, or "" for theme/ (the custom one) or Default
 	} settings;
 	static constexpr const char *quitNames[4] = { "hold OPTIONS + SHARE", "hold L1 + R1 + OPTIONS", "hold CIRCLE (2 seconds)",
@@ -2042,7 +2048,7 @@ public:
 		settings.artBackgrounds = flag("art_backgrounds", true);
 		settings.sounds = flag("sounds", true);
 		settings.grid = flag("grid", false);
-		settings.layout = std::clamp(ini.count("layout") ? std::atoi(ini["layout"].c_str()) : 0, 0, 1);
+		settings.layout = std::clamp(ini.count("layout") ? std::atoi(ini["layout"].c_str()) : 0, 0, 2);
 		settings.themeName = ini.count("theme_name") ? ini["theme_name"] : "";
 		if (ini.count("collections") && !ini["collections"].empty()) {
 			std::stringstream cs(ini["collections"]);
@@ -2385,6 +2391,12 @@ public:
 				filterMode = std::clamp(std::atoi(t + test.find("filter=") + 7), 0, filterCount - 1);
 			}
 			menuOpen = test.find("menu") != std::string::npos;
+			if (test.find("manager") != std::string::npos) {
+				// manager, managerpage=N (0 actions, 1 collections, 2 category, 3 details, 10 covers), managerindex=N
+				managerOpen = true;
+				if (test.find("managerpage=") != std::string::npos) managerPage = std::atoi(t + test.find("managerpage=") + 12);
+				if (test.find("managerindex=") != std::string::npos) managerIndex = std::clamp(std::atoi(t + test.find("managerindex=") + 13), 0, managerActions - 1);
+			}
 			if (test.find("search=") != std::string::npos) {
 				// search=TEXT (underscores for spaces), up to the next space
 				const size_t at = test.find("search=") + 7, end = test.find(' ', at);
@@ -2539,8 +2551,10 @@ public:
 	// ---------------------------------------------------------------- layout
 
 	// Showcase: tall 3:4 covers turned only a little, side by side; Classic: square, steep
-	bool showcase() const { return settings.layout == 0 && !settings.grid; }
-	float sideAngleNow() const { return settings.angle >= 0 ? settings.angle : (settings.layout == 0 ? 32.0f : theme.sideAngle); }
+	bool showcase() const { return settings.layout != 1 && !settings.grid; }
+	// The v24 dashboard draws the home screen as a row of cards (not in the grid)
+	bool dashboard() const { return settings.layout == 0 && !settings.grid; }
+	float sideAngleNow() const { return settings.angle >= 0 ? settings.angle : (settings.layout != 1 ? 32.0f : theme.sideAngle); }
 
 	// Where cover i stands, from its offset to the sliding position
 	glm::mat4 coverModel(float offset) const
@@ -2645,7 +2659,7 @@ public:
 		return {
 			{ "Return to Cover Flow when a game closes", onOff(settings.returnAfter) },
 			{ "Grid view  (L3)", onOff(settings.grid) },
-			{ "Layout", settings.layout == 0 ? std::string("Showcase") : std::string("Classic") },
+			{ "Layout", settings.layout == 0 ? std::string("Dashboard") : settings.layout == 2 ? std::string("Showcase") : std::string("Classic") },
 			{ "Game artwork behind the covers", onOff(settings.artBackgrounds) },
 			{ "Free space", drivesText },
 			{ "Import covers and names from USB", importJob ? std::string("Importing...") : std::string("") },
@@ -2681,8 +2695,8 @@ public:
 			settings.returnAfter = !settings.returnAfter;
 			break;
 		case S_LAYOUT:
-			settings.layout = 1 - settings.layout;
-			showMessage(settings.layout == 0 ? "Showcase: tall covers, gently turned" : "Classic: square covers, steeply turned", 3.0f);
+			settings.layout = (settings.layout + (delta < 0 ? 2 : 1)) % 3;
+			showMessage(settings.layout == 0 ? "Dashboard: a row of cards" : settings.layout == 2 ? "Showcase: tall covers, gently turned" : "Classic: square covers, steeply turned", 3.0f);
 			break;
 		case S_GRID:
 			settings.grid = !settings.grid;
@@ -3898,6 +3912,32 @@ public:
 		}
 	}
 
+	// Game Manager actions use the same persisted settings and view updates as the
+	// game menu: Play, Favourites, Collections, Details, Manage Covers, Settings
+	void managerAction()
+	{
+		const Game *g = current();
+		if (!g) { managerOpen = false; return; }
+		const std::string id = g->titleId, name = g->title;
+		switch (managerIndex) {
+		case 0:
+			managerOpen = false;
+			launch(*g);
+			break;
+		case 1:
+			if (id.empty()) { showMessage("A title ID is required", 3.0f); return; }
+			if (favourites.erase(id)) showMessage(name + " removed from favourites", 2.5f);
+			else { favourites.insert(id); showMessage(name + " added to favourites", 2.5f); }
+			saveSettings(); rebuildView();
+			break;
+		case 2: managerPage = 1; collectionIndex = 0; break;
+		case 3: managerPage = 3; requestSize(*g); break;
+		case 4: managerPage = 10; coverActionIndex = 0; break;
+		case 5: managerOpen = false; settingsOpen = true; settingsIndex = 0; refreshDrives(); break;
+		default: break;
+		}
+	}
+
 	// Back to the console's name and the game icon: Cover Flow's override files go
 	void resetCustom(int index)
 	{
@@ -4189,6 +4229,43 @@ public:
 		if (released & PAD_OPTIONS) {
 			optionsInCombo = false;
 		}
+		// The Game Manager takes the pad while open
+		if (managerOpen) {
+			if (!current()) { managerOpen = false; return; }
+			if (p.pressed & PAD_CIRCLE) {
+				if (managerPage == 0) { managerOpen = false; circleHeld = -10.0f; }
+				else managerPage = 0;
+				playSound(2); return;
+			}
+			if (managerPage == 0) {
+				if (p.pressed & PAD_UP) managerIndex = (managerIndex + managerActions - 1) % managerActions;
+				if (p.pressed & PAD_DOWN) managerIndex = (managerIndex + 1) % managerActions;
+				if (p.pressed & PAD_CROSS) managerAction();
+			} else if (managerPage == 1) {
+				if (p.pressed & PAD_UP) collectionIndex = (collectionIndex + collectionCount - 1) % collectionCount;
+				if (p.pressed & PAD_DOWN) collectionIndex = (collectionIndex + 1) % collectionCount;
+				if (p.pressed & PAD_CROSS) toggleCollection(collectionIndex);
+			} else if (managerPage == 2) {
+				if (p.pressed & PAD_UP) categoryIndex = (categoryIndex + 4) % 5;
+				if (p.pressed & PAD_DOWN) categoryIndex = (categoryIndex + 1) % 5;
+				if (p.pressed & PAD_CROSS) { applyCategory(categoryIndex); managerPage = 3; }
+			} else if (managerPage == 3) {
+				if (p.pressed & PAD_CROSS) { managerPage = 2; categoryIndex = 0; }
+			} else if (managerPage == 10) {
+				if (p.pressed & PAD_UP) coverActionIndex = (coverActionIndex + 2) % 3;
+				if (p.pressed & PAD_DOWN) coverActionIndex = (coverActionIndex + 1) % 3;
+				if (p.pressed & PAD_CROSS) {
+					const Game *g = current();
+					if (coverActionIndex == 0) { managerPage = 1; collectionIndex = 0; }
+					else if (coverActionIndex == 1) { managerPage = 2; categoryIndex = 0; }
+					else if (g && (g->renamed || g->customCover)) {
+						const int idx = view[selected]; managerOpen = false; resetCustom(idx);
+					} else showMessage("Already using original cover and name", 2.5f);
+				}
+			}
+			return;
+		}
+
 		// The update dialog and the settings screen take the pad while open
 		if (updateDialog) {
 			if (p.pressed & (PAD_LEFT | PAD_RIGHT)) {
@@ -4369,11 +4446,13 @@ public:
 		}
 		const Game *game = current();
 		if ((p.pressed & PAD_TRIANGLE) && game) {
-			menuOpen = !menuOpen;
-			menuIndex = 0;
-			categoryOpen = false;
-			collectionsOpen = false;
-			playSound(menuOpen ? 1 : 2);
+			// TRIANGLE opens the Game Manager
+			menuOpen = false;
+			managerOpen = true;
+			managerPage = 0;
+			managerIndex = 0;
+			requestSize(*game);
+			playSound(1);
 		}
 		if (menuOpen && !game) {
 			menuOpen = false;
@@ -4639,7 +4718,7 @@ public:
 		}
 		pollUpdates(dt);
 		pollTools();
-		if (menuOpen && current()) {
+		if ((menuOpen || managerOpen) && current()) {
 			requestSize(*current());
 		}
 		updateCamera();
@@ -4942,6 +5021,72 @@ public:
 			}
 		};
 
+		// The dashboard (v24): the covers as a row of cards in the blue layout.
+		// This replaces the old full-screen title/metadata overlay on the home screen.
+		if (dashboard() && !menuOpen && !managerOpen && !settingsOpen && !updateDialog &&
+			wizard == WZ_NONE && !launcherPanel && searchAnim < 0.01f && !searchOpen) {
+			dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(5, 13, 32, 250));
+			dl->AddRectFilledMultiColor(ImVec2(0, 0), ImVec2(W, H),
+				IM_COL32(15, 50, 104, 190), IM_COL32(5, 12, 33, 150),
+				IM_COL32(3, 9, 27, 190), IM_COL32(4, 13, 35, 210));
+			const float m = 68.0f * s;
+			icon("pad", m + 23.0f * s, 75.0f * s, 22.0f * s, accentC);
+			title("Cover Flow", 42.0f * s, m + 60.0f * s, 47.0f * s, white);
+			chip(filterName(filterMode), m, 113.0f * s, 21.0f * s, IM_COL32(0, 125, 255, 210), white);
+			text(sortNames[sortMode], 20.0f * s, m + 220.0f * s, 124.0f * s, dimC);
+			text(clockText(), 25.0f * s, W - m, 58.0f * s, white, 1.0f);
+			const float rowY = H * 0.285f, centerX = W * 0.5f;
+			if (!view.empty()) {
+				const Game &g = *current();
+				// Cards from the outside in, so the selected one is drawn last, on top; sizes
+				// 315 / 244 / 190 / 150 with a 26-pixel gap between neighbours
+				auto cardSize = [&](int d) { return (d == 0 ? 315.0f : d == 1 ? 244.0f : d == 2 ? 190.0f : 150.0f) * s; };
+				auto cardX = [&](int offset) {
+					const int d = std::abs(offset);
+					float x = 0.0f;
+					for (int k = 1; k <= d; ++k) x += (cardSize(k - 1) + cardSize(k)) * 0.5f + 26.0f * s;
+					return centerX + (offset < 0 ? -x : x);
+				};
+				for (int d = 3; d >= 0; --d) {
+					for (int sign : { -1, 1 }) {
+						if (d == 0 && sign > 0) continue;
+						const int offset = d * sign, ix = selected + offset;
+						if (ix < 0 || ix >= (int)view.size()) continue;
+						const Game &card = games[view[ix]];
+						const float sz = cardSize(d);
+						const float x = cardX(offset) - sz * 0.5f;
+						const float y = rowY + (315.0f * s - sz) * 0.5f;
+						if (x + sz < 0 || x > W) continue;
+						if (offset == 0) {
+							for (int glow = 3; glow >= 1; --glow)
+								dl->AddRect(ImVec2(x - glow * 5.0f * s, y - glow * 5.0f * s), ImVec2(x + sz + glow * 5.0f * s, y + sz + glow * 5.0f * s),
+									IM_COL32(0, 160, 255, 75 / glow), 13.0f * s, ImDrawCornerFlags_All, 4.0f * s);
+						}
+						cover(card, x, y, sz, d == 0 ? 1.0f : d == 1 ? 0.9f : 0.7f, 12.0f * s);
+						if (offset == 0) dl->AddRect(ImVec2(x, y), ImVec2(x + sz, y + sz), IM_COL32(65, 204, 255, 255), 12.0f * s, ImDrawCornerFlags_All, 4.0f * s);
+						const VkDescriptorSet set = card.loaded && card.descriptorSet != VK_NULL_HANDLE ? card.descriptorSet : placeholderSet;
+						if (set != VK_NULL_HANDLE) dl->AddImage((ImTextureID)set, ImVec2(x, y + sz + 6.0f * s),
+							ImVec2(x + sz, y + sz + 78.0f * s), ImVec2(0, 1), ImVec2(1, 0.78f), IM_COL32(255, 255, 255, d == 0 ? 40 : 26));
+					}
+				}
+				title(fit(g.title, 42.0f * s, W * 0.7f), 42.0f * s, centerX, H * 0.755f, white, 0.5f);
+				const auto pt = playTime.find(g.titleId);
+				const std::string stats = "Last played: " + (pt == playTime.end() ? "Not yet" : formatAgo(pt->second.last)) +
+					"     Play time: " + (pt == playTime.end() ? "0 min" : formatDuration(pt->second.seconds));
+				text(stats, 23.0f * s, centerX, H * 0.82f, dimC, 0.5f);
+			} else {
+				title("No games in this view", 37.0f * s, centerX, H * 0.5f, white, 0.5f);
+			}
+			dl->AddRectFilled(ImVec2(m, H - 90.0f * s), ImVec2(W - m, H - 30.0f * s), IM_COL32(15, 33, 65, 195), 25.0f * s);
+			text("X  Play     TRIANGLE  Game menu     R3  Search     TOUCHPAD  Filter     SQUARE  Sort     OPTIONS  Settings",
+				21.0f * s, W * 0.5f, H - 71.0f * s, textC, 0.5f);
+			if (messageTimer > 0.0f && !message.empty()) text(fit(message, 22.0f * s, W * 0.75f), 22.0f * s, centerX, H - 135.0f * s, accentC, 0.5f);
+			if (introTime < 0.7f) {
+				dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, (int)(255 * (1.0f - introTime / 0.7f))));
+			}
+			return;
+		}
+
 		// ---- the header: heading, filter and sort; count and where the library came from
 		const float margin = 72.0f * s;
 		icon("pad", margin + 26.0f * s, 72.0f * s, 22.0f * s, withAlpha(accentC, 1.0f));
@@ -4997,7 +5142,7 @@ public:
 		// ---- the selected game's name, category and favourite mark
 		if (!view.empty()) {
 			const Game &game = *current();
-			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f) * (1.0f - searchAnim);
+			const float fade = std::clamp(1.0f - std::abs(selected - position) * 2.0f, 0.0f, 1.0f) * (1.0f - std::max(menuAnim, settingsAnim) * 0.85f) * (1.0f - searchAnim) * (managerOpen ? 0.0f : 1.0f);
 			const float titleSize = 54.0f * s, ty = H * 0.775f;
 			title(fit(game.title, titleSize, W * 0.8f), titleSize, W * 0.5f, ty, withAlpha(textC, fade), 0.5f);
 			std::string meta = game.subtitle.empty() ? categoryName(game.section) : game.subtitle;
@@ -5061,7 +5206,7 @@ public:
 
 		// ---- behind a panel, the row dims
 		{
-			const float dim = std::max(std::max(std::max(menuAnim, settingsAnim), dialogAnim), launcherPanel ? 1.0f : 0.0f);
+			const float dim = std::max(std::max(std::max(menuAnim, settingsAnim), dialogAnim), (launcherPanel || managerOpen) ? 1.0f : 0.0f);
 			if (dim > 0.01f) {
 				dl->AddRectFilled(ImVec2(0, 0), ImVec2(W, H), IM_COL32(0, 0, 0, (int)(110 * dim)));
 			}
@@ -5070,7 +5215,7 @@ public:
 		// ---- the game menu: the game at the top, actions on the left, its cover and details on the right
 		if (menuAnim > 0.01f && current()) {
 			const Game &game = *current();
-			const float a = menuAnim, w = 1380.0f * s, h = 700.0f * s;
+			const float a = menuAnim, w = 1380.0f * s, h = 770.0f * s;
 			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f + (1.0f - a) * 24.0f * s;
 			panel(x0, y0, w, h, a);
 			const float pad = 36.0f * s;
@@ -5082,7 +5227,7 @@ public:
 			text(game.titleId.empty() ? categoryName(game.section) : "ID: " + game.titleId + "   \xC2\xB7   " + categoryName(game.section), 21.0f * s, x0 + pad + 116.0f * s, y0 + pad + 54.0f * s, withAlpha(dimC, a), 0.0f, false);
 			// Actions, each with its icon
 			const std::vector<std::string> items = menuItems(game);
-			const float bx = x0 + pad, bw = listW, bh = 58.0f * s;
+			const float bx = x0 + pad, bw = listW, bh = 54.0f * s;
 			float by = y0 + pad + 120.0f * s;
 			dl->AddRectFilled(ImVec2(bx - 6.0f * s, by - 6.0f * s), ImVec2(bx + bw + 6.0f * s, by + items.size() * (bh + 8.0f * s) + 2.0f * s), IM_COL32(255, 255, 255, (int)(10 * a)), 16.0f * s);
 			for (int i = 0; i < (int)items.size(); i++) {
@@ -5100,7 +5245,7 @@ public:
 				const ImU32 ic = kind == "star" && isFavourite(game) ? IM_COL32(255, 200, 70, 255) : (on ? white : textC);
 				icon(kind, bx + 34.0f * s, by + bh * 0.5f, 12.0f * s, withAlpha(ic, a));
 				text(fit(it, 24.0f * s, bw - 90.0f * s), 24.0f * s, bx + 66.0f * s, by + 15.0f * s, withAlpha(on ? white : textC, a), 0.0f, false);
-				by += bh + 8.0f * s;
+				by += bh + 5.0f * s;
 			}
 			// The card: its cover, large, and the details
 			const float cx = x0 + w * 0.56f + 12.0f * s, cy = y0 + pad, cw = x0 + w - pad - cx, ch = h - pad * 2.0f - 50.0f * s;
@@ -5536,6 +5681,67 @@ public:
 			}
 		}
 
+		// ---- the Game Manager: actions on the left, the game's cover and details on the right
+		if (managerOpen && current()) {
+			const Game &game = *current();
+			const float w = 1310.0f * s, h = 760.0f * s;
+			const float x0 = (W - w) * 0.5f, y0 = (H - h) * 0.5f;
+			panel(x0, y0, w, h, 1.0f);
+			const float pad = 42.0f * s;
+			cover(game, x0 + pad, y0 + pad, 95.0f * s, 1.0f, 11.0f * s);
+			title(fit(game.title, 33.0f * s, 850.0f * s), 33.0f * s, x0 + 158.0f * s, y0 + 53.0f * s, white);
+			text("ID: " + (game.titleId.empty() ? "Unknown" : game.titleId), 21.0f * s, x0 + 158.0f * s, y0 + 100.0f * s, dimC);
+			const float bx = x0 + pad, by = y0 + 169.0f * s, bw = 605.0f * s, bh = 66.0f * s;
+			auto line = [&](int index, const std::string &label, const std::string &kind, float yy, bool focus) {
+				dl->AddRectFilled(ImVec2(bx, yy), ImVec2(bx + bw, yy + bh), focus ? IM_COL32(0, 124, 238, 255) : IM_COL32(22, 50, 95, 205), 12.0f * s);
+				if (focus) dl->AddRect(ImVec2(bx, yy), ImVec2(bx + bw, yy + bh), IM_COL32(66, 211, 255, 255), 12.0f * s, ImDrawCornerFlags_All, 2.5f * s);
+				icon(kind, bx + 35.0f * s, yy + 33.0f * s, 14.0f * s, white);
+				text(fit(label, 24.0f * s, bw - 110.0f * s), 24.0f * s, bx + 75.0f * s, yy + 17.0f * s, white);
+			};
+			const float rx = x0 + 695.0f * s, rw = 565.0f * s;
+			dl->AddRectFilled(ImVec2(rx, by), ImVec2(rx + rw, y0 + h - 85.0f * s), IM_COL32(8, 24, 53, 235), 16.0f * s);
+			dl->AddRect(ImVec2(rx, by), ImVec2(rx + rw, y0 + h - 85.0f * s), IM_COL32(42, 125, 207, 110), 16.0f * s, ImDrawCornerFlags_All, 1.4f * s);
+			const auto pt = playTime.find(game.titleId);
+			const std::string sz = game.bytes <= 0 ? "Unknown" : formatSize(game.bytes);
+			if (managerPage == 0) {
+				const std::vector<std::string> labels = { "Play Game", isFavourite(game) ? "Remove from Favorites" : "Add to Favorites",
+					"Add to Collection", "View Details", "Manage Covers", "Settings" };
+				const char *icons[] = { "play", "star", "folder", "info", "reset", "gear" };
+				for (int i = 0; i < managerActions; ++i) line(i, labels[i], icons[i], by + i * 69.0f * s, i == managerIndex);
+				cover(game, rx + (rw - 240.0f * s) * 0.5f, by + 28.0f * s, 240.0f * s, 1.0f, 14.0f * s);
+				title(fit(game.title, 25.0f * s, rw - 55.0f * s), 25.0f * s, rx + 28.0f * s, by + 290.0f * s, white);
+				text("ID: " + game.titleId, 21.0f * s, rx + 28.0f * s, by + 335.0f * s, dimC);
+				text("Size: " + sz, 21.0f * s, rx + 28.0f * s, by + 370.0f * s, textC);
+				text("Last played: " + (pt == playTime.end() ? "Not yet" : formatAgo(pt->second.last)), 21.0f * s, rx + 28.0f * s, by + 405.0f * s, textC);
+				text("Play time: " + (pt == playTime.end() ? "0 min" : formatDuration(pt->second.seconds)), 21.0f * s, rx + 28.0f * s, by + 440.0f * s, textC);
+			} else {
+				std::string heading = managerPage == 1 ? "Collections" : managerPage == 2 ? "Category" : managerPage == 3 ? "Game Details" : "Manage Covers";
+				title(heading, 29.0f * s, bx, by + 3.0f * s, white);
+				const float yy = by + 74.0f * s;
+				if (managerPage == 1) {
+					for (int i = 0; i < collectionCount; ++i)
+						line(i, std::string(inCollection(game, i) ? "[x]  " : "[ ]  ") + collectionNames[i], "folder", yy + i * 69.0f * s, i == collectionIndex);
+				} else if (managerPage == 2) {
+					for (int i = 0; i < 5; ++i) line(i, i == 0 ? "Automatic" : categoryKeys[i], "tag", yy + i * 69.0f * s, i == categoryIndex);
+				} else if (managerPage == 3) {
+					const std::vector<std::string> lines = { "Title ID: " + game.titleId, "Category: " + categoryName(game.section), "Size: " + sz,
+						"Installed: " + formatDate(game.installed), "Last played: " + (pt == playTime.end() ? "Not yet" : formatAgo(pt->second.last)),
+						"Play time: " + (pt == playTime.end() ? "0 min" : formatDuration(pt->second.seconds)), "Collections: " + collectionSummary(game) };
+					for (int i = 0; i < (int)lines.size(); ++i) text(fit(lines[i], 23.0f * s, bw - 15.0f * s), 23.0f * s, bx + 8.0f * s, yy + i * 53.0f * s, textC);
+					text("X  Change category", 22.0f * s, bx, yy + 420.0f * s, accentC);
+				} else if (managerPage == 10) {
+					line(0, "Manage Collections", "folder", yy + 12.0f * s, coverActionIndex == 0);
+					line(1, "Change Category", "tag", yy + 90.0f * s, coverActionIndex == 1);
+					line(2, "Restore Original Name / Cover", "reset", yy + 168.0f * s, coverActionIndex == 2);
+				}
+				cover(game, rx + (rw - 235.0f * s) * 0.5f, by + 30.0f * s, 235.0f * s, 1.0f, 12.0f * s);
+				title(fit(game.title, 24.0f * s, rw - 50.0f * s), 24.0f * s, rx + 25.0f * s, by + 292.0f * s, white);
+				text("ID: " + game.titleId, 21.0f * s, rx + 25.0f * s, by + 340.0f * s, dimC);
+				text("Size: " + sz, 21.0f * s, rx + 25.0f * s, by + 377.0f * s, textC);
+			}
+			text("D-PAD  Navigate     X  Select     O  Back", 21.0f * s, x0 + w * 0.5f, y0 + h - 49.0f * s, accentC, 0.5f);
+		}
+
 		// ---- the search keyboard, along the bottom so the matching covers stay in sight
 		if (searchAnim > 0.01f) {
 			const float a = searchAnim, pad = 34.0f * s, gap = 10.0f * s, keyH = 62.0f * s, fieldH = 76.0f * s;
@@ -5607,7 +5813,7 @@ public:
 		}
 
 		// ---- the hints along the bottom
-		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && wizardAnim < 0.5f && searchAnim < 0.5f && !launcherPanel) {
+		if (settingsAnim < 0.5f && menuAnim < 0.5f && dialogAnim < 0.5f && wizardAnim < 0.5f && searchAnim < 0.5f && !launcherPanel && !managerOpen) {
 			std::vector<std::pair<std::vector<Glyph>, std::string>> items = {
 				{ { G_DPAD_LR }, "Browse" }, { { G_L2, G_R2 }, "Letter" }, { { G_CROSS }, "Start" }, { { G_TRIANGLE }, "Menu" },
 				{ { G_SQUARE }, "Sort" }, { { G_TOUCHPAD }, "Filter" }, { { G_R3 }, "Search" }, { { G_L3 }, settings.grid ? "Cover Flow" : "Grid" }, { { G_OPTIONS }, "Settings" },
