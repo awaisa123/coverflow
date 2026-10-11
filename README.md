@@ -154,17 +154,11 @@ See [Releases](https://github.com/awaisa123/coverflow/releases) for downloadable
 
 Some historical builds support in-app updating with SHA-256 verification. Always follow the release-specific guidance, particularly when a frontend or launcher protocol changes. Keep a known-working copy before updating.
 
-## Licenses and credits
+## Credits and licenses
 
-The project includes components under different licenses:
+Google Flow depends on the work of numerous open-source contributors. Special thanks to **[Mihawk-99](https://github.com/mihawk-99)** and the **[PS5_VulkanTemplate](https://github.com/mihawk-99/PS5_VulkanTemplate)** project, **[Sascha Willems](https://github.com/SaschaWillems)**, **[John Törnblom](https://github.com/john-tornblom)** and the **[ps5-payload-dev](https://github.com/ps5-payload-dev)** community, plus contributors to **Mesa/RADV**, **Dear ImGui**, the **Vulkan ecosystem** and other libraries.
 
-- Original Cover Flow UI code and project-specific assets: see the corresponding source notices (historically MIT for the UI).
-- Resident launcher and PS5 platform components: GPL-3.0-or-later in the historical repository.
-- Vulkan/RADV/Mesa, Dear ImGui and other dependencies: see the accompanying license notices and component manifests for the actual release.
-
-Licensing and attribution must be reviewed again before distributing new development builds or incorporating third-party source.
-
-Thanks to contributors to the PS5 homebrew tooling, Vulkan/RADV, PS5 Payload SDK and related open-source projects.
+**[Read the full contributor and third-party credits](CREDITS.md)**, including direct foundations, licensing notices and separately labelled technical references. The repository's [existing license notice](licenses/README.txt) and [component manifest](licenses/components.json) document historical distributed dependencies. Third-party licensing and notices remain applicable.
 
 ---
 
