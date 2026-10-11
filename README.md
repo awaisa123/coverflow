@@ -41,9 +41,15 @@ The current local v28 development tree has reported builds and host regression t
 
 **Limitations:** A folder archive is **not** automatically a playable or restorable PS5 game. Availability of application mounts, permissions, payload loading and the newer workflows remains dependent on the particular console environment and requires physical-console verification. Existing image copying does **not** create new FFPKG, PFS or PKG images. The diagnostic proxy also requires a compatible resident control payload; the Python utility alone cannot enable it.
 
-## Screenshots
+## Interface preview
 
-Screenshots of the current interface will be added here after selecting and verifying captures from the intended build. This README deliberately avoids using older screenshots as if they were v28.
+| Home | Game Manager | Settings |
+| --- | --- | --- |
+| Cover carousel, artwork backdrop and category navigation | Game actions, title information and management options | Library, appearance, storage, updates and system preferences |
+
+**Screenshots are being prepared.** The available development previews use demo titles and have not been verified as captures from the current PS5 build. We will add real captures here after confirming the exact build and checking that no private information is shown.
+
+See [screenshot requirements and release checklist](docs/RELEASE_PREPARATION.md) for the planned gallery.
 
 ## Controller guide
 
